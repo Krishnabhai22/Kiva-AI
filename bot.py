@@ -17,6 +17,7 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    CopyTextButton,
 )
 
 from telegram.constants import ChatAction
@@ -1069,17 +1070,11 @@ async def start(
     user = update.effective_user
     name = get_display_name(user)
 
-    message = f"""
-✨ <b>Welcome to KIVA AI</b>
-
-{name}, good to see you.
-
-━━━━━━━━━━━━━━━━━━
-
-<b>KIVA AI is ready.</b>
-
-Bas jo chahiye, seedha message mein batao.
-"""
+    message = (
+        "✨ <b>Welcome to KIVA AI</b>\n\n"
+        f"{html.escape(name)}, it’s great to have you here.\n\n"
+        "How can I help you today?"
+    )
 
     await tracked_reply_text(
         update.message,
@@ -1092,53 +1087,41 @@ Bas jo chahiye, seedha message mein batao.
 # OWNER
 # =========================================================
 
+OWNER_COPY_TEXT = (
+    "KIVA AI\n\n"
+    "Founder & Developer — Krishna Singh\n\n"
+    "Telegram — @qrishna\n\n"
+    "Engine — Kiva AI-3.6-flash\n\n"
+    "Image Engine — Kiva AI-3.1-flash-image\n\n"
+    "Memory — Active\n\n"
+    "Built & maintained by Krishna Singh"
+)
+
+
 async def owner_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
     await track_incoming_message(update.message)
 
-    text = f"""
-💳 <b>KIVA AI</b>
-
-━━━━━━━━━━━━━━━━━━
-
-👤 <b>OWNER</b>
-<b>{OWNER_NAME}</b>
-
-✈️ Telegram
-<a href="{OWNER_URL}">@{OWNER_USERNAME}</a>
-
-━━━━━━━━━━━━━━━━━━
-
-⚡ <b>Engine</b>
-<code>{PUBLIC_TEXT_ENGINE}</code>
-
-🎨 <b>Image Engine</b>
-<code>{PUBLIC_IMAGE_ENGINE}</code>
-
-🧠 <b>Memory</b>
-Active
-
-━━━━━━━━━━━━━━━━━━
-
-<b>Built & maintained by {OWNER_NAME}.</b>
-"""
-
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
+                "📋 Copy",
+                copy_text=CopyTextButton(
+                    text=OWNER_COPY_TEXT
+                ),
+            ),
+            InlineKeyboardButton(
                 "✈️ Contact Owner",
                 url=OWNER_URL,
-            )
+            ),
         ]
     ])
 
     await tracked_reply_text(
         update.message,
-        text,
-        parse_mode="HTML",
-        disable_web_page_preview=True,
+        OWNER_COPY_TEXT,
         reply_markup=keyboard,
     )
 
@@ -1181,7 +1164,7 @@ async def image_command(
     try:
 
         await tracked_reply_text(update.message,
-            "🎨 <b>Creating your image…</b>\n\n"
+            "🎨 <b>Generating your Image…</b>\n\n"
             "Turning your prompt into a visual. ✨",
             parse_mode="HTML",
         )
@@ -1204,8 +1187,8 @@ async def image_command(
         )
 
         await tracked_reply_text(update.message,
-            "⚠️ <b>Image generation failed.</b>\n\n"
-            "Please try again in a few seconds.",
+            "⚠️ <b>Image generation is temporarily unavailable.</b>\n\n"
+            "Please try again later.",
             parse_mode="HTML",
         )
 
@@ -1270,7 +1253,7 @@ async def text_message(
         if not image_prompt:
 
             await tracked_reply_text(update.message,
-                "🎨 Bataiye image mein kya create karna hai?"
+                "🎨 Tell me what you want to create."
             )
 
             return
@@ -1288,8 +1271,8 @@ async def text_message(
         try:
 
             await tracked_reply_text(update.message,
-                "🎨 <b>Creating your image…</b>\n\n"
-                "Aapke prompt ko visual mein convert kar raha hoon. ✨",
+                "🎨 <b>Generating your Image…</b>\n\n"
+                "Turning your prompt into a visual. ✨",
                 parse_mode="HTML",
             )
 
@@ -1311,8 +1294,8 @@ async def text_message(
             )
 
             await tracked_reply_text(update.message,
-                "⚠️ <b>Image generation temporarily unavailable.</b>\n\n"
-                "Please try again.",
+                "⚠️ <b>Image generation is temporarily unavailable.</b>\n\n"
+                "Please try again later.",
                 parse_mode="HTML",
             )
 
@@ -1769,8 +1752,9 @@ async def error_handler(
 async def post_init(
     application: Application
 ):
+    # /start remains functional for Telegram's native Start Bot flow,
+    # but it is intentionally hidden from the command menu.
     await application.bot.set_my_commands([
-        ("start", "Open KIVA AI"),
         ("image", "Generate an AI image"),
         ("owner", "KIVA AI owner"),
     ])
