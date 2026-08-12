@@ -3,6 +3,7 @@ import sqlite3
 import threading
 import html
 import time
+import traceback
 
 import telebot
 from flask import Flask, request
@@ -16,7 +17,7 @@ TOKEN = os.environ.get("API_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 BOT_NAME = "KIVA AI"
-BOT_VERSION = "3.7 WEBHOOK PROFESSIONAL"
+BOT_VERSION = "3.8 WEBHOOK DEBUGGER"
 
 DB_FILE = "kiva_ai.db"
 
@@ -34,7 +35,6 @@ genai.configure(api_key=GEMINI_API_KEY)
 
 ai_model = genai.GenerativeModel("gemini-1.5-flash")
 
-# Automatically set webhook using Render's live URL
 RENDER_EXTERNAL_URL = "https://kiva-ai.onrender.com/"
 webhook_url = f"{RENDER_EXTERNAL_URL}{TOKEN}"
 try:
@@ -135,8 +135,12 @@ def handle_ai_messages(message):
         response = ai_model.generate_content(full_prompt)
         ai_reply = response.text if response and response.text else "I am processing your request. Could you please rephrase?"
     except Exception as err:
-        print(f"AI Generation Error: {err}")
-        ai_reply = "Kiva AI is currently processing high volume. Please try again shortly."
+        # Printing full detailed traceback in Render logs so we see the exact root cause
+        print("----------------- GEMINI ERROR START -----------------")
+        traceback.print_exc()
+        print(f"Error Message: {err}")
+        print("----------------- GEMINI ERROR END -------------------")
+        ai_reply = f"Error details: {str(err)}"
 
     if len(ai_reply) > 4000:
         ai_reply = ai_reply[:4000] + "\n\n<i>[Response truncated due to length limits]</i>"
