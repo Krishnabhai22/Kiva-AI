@@ -20,7 +20,7 @@ TOKEN = os.environ.get("API_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 BOT_NAME = "KIVA AI"
-BOT_VERSION = "3.0 ULTRA PROFESSIONAL"
+BOT_VERSION = "3.1 ULTRA PROFESSIONAL"
 
 OWNER_IDS = {
     1332494807
@@ -45,29 +45,9 @@ if not GEMINI_API_KEY:
 bot = telebot.TeleBot(TOKEN, parse_mode=None)
 genai.configure(api_key=GEMINI_API_KEY)
 
-# System instruction to make it behave like a professional standalone AI (Kiva AI)
-SYSTEM_INSTRUCTION = (
-    "You are Kiva AI, an advanced, highly intelligent, and professional AI assistant "
-    "created by Krishna. You provide clean, detailed, and accurate answers. "
-    "You seamlessly detect and match the user's language—whether it is Hinglish, Hindi, "
-    "English, or any other global language—and reply in the exact same language and tone. "
-    "Never mention Google or Gemini; you are entirely Kiva AI."
-)
+ai_model = genai.GenerativeModel("gemini-1.5-flash")
 
-generation_config = {
-    "temperature": 0.7,
-    "top_p": 0.95,
-    "top_k": 40,
-    "max_output_tokens": 8192,
-}
-
-ai_model = genai.GenerativeModel(
-    model_name="gemini-1.5-flash",
-    generation_config=generation_config,
-    system_instruction=SYSTEM_INSTRUCTION
-)
-
-# Store chat sessions per user for conversational memory
+# Store chat sessions per user
 user_sessions = {}
 
 # ============================================================
@@ -114,15 +94,6 @@ def register_user(user_id, first_name, username):
         connection.commit()
         connection.close()
 
-def get_total_users():
-    with db_lock:
-        connection = get_connection()
-        cursor = connection.cursor()
-        cursor.execute("SELECT COUNT(*) FROM bot_users")
-        count = cursor.fetchone()[0]
-        connection.close()
-        return count
-
 # ============================================================
 # TELEGRAM HANDLERS
 # ============================================================
@@ -140,7 +111,7 @@ def start_command(message):
         f"<b>✨ Hii {name}! Welcome to {BOT_NAME}</b>\n"
         "────────────────────────\n"
         "I am your advanced, high-performance professional AI assistant. "
-        "You can chat with me about anything, ask questions, write code, solve problems, "
+        "You can chat with me about anything, write code, solve problems, "
         "or converse in any language (Hinglish, Hindi, English, etc.)!\n\n"
         "● <b>Status:</b> ONLINE & ACTIVE\n"
         f"● <b>Engine:</b> {BOT_VERSION}\n\n"
@@ -165,15 +136,18 @@ def handle_ai_messages(message):
         pass
 
     try:
-        # Maintain separate conversational chat history for each user (ChatGPT style memory)
         if user_id not in user_sessions:
-            user_sessions[user_id] = ai_model.start_chat(history=[])
+            # Professional persona prompt embedded in chat history initialization
+            initial_history = [
+                {"role": "user", "parts": ["You are Kiva AI, an advanced professional AI assistant created by Krishna. Never mention Google or Gemini. Match the user's language (Hinglish, Hindi, English, etc.) perfectly."]},
+                {"role": "model", "parts": ["Understood. I am Kiva AI, ready to assist."]}
+            ]
+            user_sessions[user_id] = ai_model.start_chat(history=initial_history)
         
         chat_session = user_sessions[user_id]
         response = chat_session.send_message(user_prompt)
         ai_reply = response.text if response and response.text else "I am processing your request. Could you please rephrase?"
     except Exception as e:
-        # If chat session errors out, reset session and try a direct generation fallback
         try:
             if user_id in user_sessions:
                 del user_sessions[user_id]
@@ -182,14 +156,12 @@ def handle_ai_messages(message):
         except Exception as err:
             ai_reply = f"System Error: Unable to process response right now. Please try again later."
 
-    # Handle Telegram max message length limit (4096 characters)
     if len(ai_reply) > 4000:
         ai_reply = ai_reply[:4000] + "\n\n<i>[Response truncated due to length limits]</i>"
 
     try:
         bot.reply_to(message, ai_reply, parse_mode="Markdown")
     except Exception:
-        # Fallback without markdown formatting if symbols clash
         try:
             bot.reply_to(message, ai_reply)
         except Exception as final_err:
