@@ -4,11 +4,8 @@ import sqlite3
 import threading
 import html
 import time
-import uuid
-from datetime import datetime, timedelta
 
 import telebot
-from telebot import types
 from flask import Flask
 import google.generativeai as genai
 
@@ -20,21 +17,12 @@ TOKEN = os.environ.get("API_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 BOT_NAME = "KIVA AI"
-BOT_VERSION = "3.1 ULTRA PROFESSIONAL"
-
-OWNER_IDS = {
-    1332494807
-}
+BOT_VERSION = "3.2 ULTRA PROFESSIONAL"
 
 DB_FILE = "kiva_ai.db"
 
 app = Flask(__name__)
 db_lock = threading.Lock()
-start_time = time.time()
-
-# ============================================================
-# TOKEN VALIDATION & INITIALIZATION
-# ============================================================
 
 if not TOKEN:
     raise RuntimeError("API_TOKEN environment variable is missing.")
@@ -47,13 +35,6 @@ genai.configure(api_key=GEMINI_API_KEY)
 
 ai_model = genai.GenerativeModel("gemini-1.5-flash")
 
-# Store chat sessions per user
-user_sessions = {}
-
-# ============================================================
-# FLASK KEEP-ALIVE SERVER (FOR RENDER FREE WEB SERVICE)
-# ============================================================
-
 @app.route("/")
 def home():
     return "KIVA-AI ADVANCED ENGINE • ONLINE"
@@ -61,10 +42,6 @@ def home():
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
-
-# ============================================================
-# DATABASE MANAGEMENT
-# ============================================================
 
 def get_connection():
     return sqlite3.connect(DB_FILE, check_same_thread=False, timeout=30)
@@ -93,10 +70,6 @@ def register_user(user_id, first_name, username):
         """, (user_id, first_name, username))
         connection.commit()
         connection.close()
-
-# ============================================================
-# TELEGRAM HANDLERS
-# ============================================================
 
 @bot.message_handler(commands=["start", "help"])
 def start_command(message):
@@ -136,25 +109,18 @@ def handle_ai_messages(message):
         pass
 
     try:
-        if user_id not in user_sessions:
-            # Professional persona prompt embedded in chat history initialization
-            initial_history = [
-                {"role": "user", "parts": ["You are Kiva AI, an advanced professional AI assistant created by Krishna. Never mention Google or Gemini. Match the user's language (Hinglish, Hindi, English, etc.) perfectly."]},
-                {"role": "model", "parts": ["Understood. I am Kiva AI, ready to assist."]}
-            ]
-            user_sessions[user_id] = ai_model.start_chat(history=initial_history)
+        # Professional persona prompt bundled directly with user message to ensure zero errors
+        full_prompt = (
+            "You are Kiva AI, an advanced professional AI assistant. "
+            "Never mention Google, Gemini, or any underlying model provider. "
+            "Match and reply in the user's exact language and tone (Hinglish, Hindi, English, etc.).\n\n"
+            f"User Prompt: {user_prompt}"
+        )
         
-        chat_session = user_sessions[user_id]
-        response = chat_session.send_message(user_prompt)
+        response = ai_model.generate_content(full_prompt)
         ai_reply = response.text if response and response.text else "I am processing your request. Could you please rephrase?"
     except Exception as e:
-        try:
-            if user_id in user_sessions:
-                del user_sessions[user_id]
-            fallback_response = ai_model.generate_content(user_prompt)
-            ai_reply = fallback_response.text if fallback_response and fallback_response.text else "An error occurred."
-        except Exception as err:
-            ai_reply = f"System Error: Unable to process response right now. Please try again later."
+        ai_reply = f"Kiva AI Engine Error: {e}"
 
     if len(ai_reply) > 4000:
         ai_reply = ai_reply[:4000] + "\n\n<i>[Response truncated due to length limits]</i>"
@@ -167,21 +133,10 @@ def handle_ai_messages(message):
         except Exception as final_err:
             print(f"Failed to send reply: {final_err}")
 
-# ============================================================
-# BOT BOOTSTRAP
-# ============================================================
-
 if __name__ == "__main__":
-    print("========================================")
-    print("      KIVA-AI PROFESSIONAL ENGINE")
-    print("========================================")
-
     init_database()
-
     threading.Thread(target=run_flask, daemon=True).start()
-
-    print("KIVA-AI ENGINE is ONLINE.")
-
+    
     try:
         bot.remove_webhook()
         time.sleep(1)
