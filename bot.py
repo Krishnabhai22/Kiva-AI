@@ -1,23 +1,22 @@
 import os
-import re
 import sqlite3
 import threading
 import html
 import time
 
 import telebot
-from flask import Flask
+from flask import Flask, request
 import google.generativeai as genai
 
 # ============================================================
-# KIVA AI • ADVANCED ENTERPRISE INTELLIGENCE BOT
+# KIVA AI • ADVANCED ENTERPRISE INTELLIGENCE BOT (WEBHOOK MODE)
 # ============================================================
 
 TOKEN = os.environ.get("API_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 BOT_NAME = "KIVA AI"
-BOT_VERSION = "3.4 ULTRA PROFESSIONAL"
+BOT_VERSION = "3.7 WEBHOOK PROFESSIONAL"
 
 DB_FILE = "kiva_ai.db"
 
@@ -33,16 +32,32 @@ if not GEMINI_API_KEY:
 bot = telebot.TeleBot(TOKEN, parse_mode=None)
 genai.configure(api_key=GEMINI_API_KEY)
 
-# Using the modern supported model for current API keys
 ai_model = genai.GenerativeModel("gemini-1.5-flash")
+
+# Automatically set webhook using Render's live URL
+RENDER_EXTERNAL_URL = "https://kiva-ai.onrender.com/"
+webhook_url = f"{RENDER_EXTERNAL_URL}{TOKEN}"
+try:
+    bot.remove_webhook()
+    time.sleep(1)
+    bot.set_webhook(url=webhook_url)
+    print(f"Webhook set successfully to: {webhook_url}")
+except Exception as e:
+    print(f"Webhook setup error: {e}")
 
 @app.route("/")
 def home():
-    return "KIVA-AI ADVANCED ENGINE • ONLINE"
+    return "KIVA-AI ADVANCED ENGINE • ONLINE & ACTIVE"
 
-def run_flask():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+@app.route(f"/{TOKEN}", methods=["POST"])
+def telegram_webhook():
+    if request.headers.get('content-type') == 'application/json':
+        json_string = request.get_data().decode('utf-8')
+        update = telebot.types.Update.de_json(json_string)
+        bot.process_new_updates([update])
+        return "OK", 200
+    else:
+        return "Forbidden", 403
 
 def get_connection():
     return sqlite3.connect(DB_FILE, check_same_thread=False, timeout=30)
@@ -120,9 +135,8 @@ def handle_ai_messages(message):
         response = ai_model.generate_content(full_prompt)
         ai_reply = response.text if response and response.text else "I am processing your request. Could you please rephrase?"
     except Exception as err:
-        print(f"AI Error Details: {err}")
-        # Clean professional message so users never see technical errors or model names
-        ai_reply = "Kiva AI is currently experiencing high demand. Please try sending your message again in a moment."
+        print(f"AI Generation Error: {err}")
+        ai_reply = "Kiva AI is currently processing high volume. Please try again shortly."
 
     if len(ai_reply) > 4000:
         ai_reply = ai_reply[:4000] + "\n\n<i>[Response truncated due to length limits]</i>"
@@ -137,18 +151,6 @@ def handle_ai_messages(message):
 
 if __name__ == "__main__":
     init_database()
-    threading.Thread(target=run_flask, daemon=True).start()
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
     
-    try:
-        bot.remove_webhook()
-        time.sleep(1)
-    except Exception:
-        pass
-
-    while True:
-        try:
-            bot.polling(non_stop=True, interval=1, timeout=30, skip_pending=True)
-        except Exception as e:
-            print(f"Polling error: {e}")
-            time.sleep(3)
-            
