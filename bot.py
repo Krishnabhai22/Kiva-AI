@@ -17,7 +17,7 @@ TOKEN = os.environ.get("API_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 BOT_NAME = "KIVA AI"
-BOT_VERSION = "3.3 ULTRA PROFESSIONAL"
+BOT_VERSION = "3.4 ULTRA PROFESSIONAL"
 
 DB_FILE = "kiva_ai.db"
 
@@ -33,8 +33,8 @@ if not GEMINI_API_KEY:
 bot = telebot.TeleBot(TOKEN, parse_mode=None)
 genai.configure(api_key=GEMINI_API_KEY)
 
-# Using gemini-pro for full compatibility across all environments
-ai_model = genai.GenerativeModel("gemini-pro")
+# Using the modern supported model for current API keys
+ai_model = genai.GenerativeModel("gemini-1.5-flash")
 
 @app.route("/")
 def home():
@@ -119,8 +119,10 @@ def handle_ai_messages(message):
         
         response = ai_model.generate_content(full_prompt)
         ai_reply = response.text if response and response.text else "I am processing your request. Could you please rephrase?"
-    except Exception as e:
-        ai_reply = f"Kiva AI Engine Error: {e}"
+    except Exception as err:
+        print(f"AI Error Details: {err}")
+        # Clean professional message so users never see technical errors or model names
+        ai_reply = "Kiva AI is currently experiencing high demand. Please try sending your message again in a moment."
 
     if len(ai_reply) > 4000:
         ai_reply = ai_reply[:4000] + "\n\n<i>[Response truncated due to length limits]</i>"
