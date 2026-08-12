@@ -10,14 +10,14 @@ from flask import Flask, request
 import google.generativeai as genai
 
 # ============================================================
-# KIVA AI • FINAL BULLETPROOF ENGINE
+# KIVA AI • BULLETPROOF STABLE ENGINE
 # ============================================================
 
 TOKEN = os.environ.get("API_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 BOT_NAME = "KIVA AI"
-BOT_VERSION = "5.0 ULTIMATE FIX"
+BOT_VERSION = "6.0 BULLETPROOF"
 
 DB_FILE = "kiva_ai.db"
 
@@ -33,18 +33,14 @@ if not GEMINI_API_KEY:
 bot = telebot.TeleBot(TOKEN, parse_mode=None)
 genai.configure(api_key=GEMINI_API_KEY)
 
-# Bulletproof dynamic model selection
-def get_working_model():
+# Guaranteed stable model initialization for version 0.3.2
+def get_safe_model():
     try:
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                if 'flash' in m.name or 'pro' in m.name:
-                    return genai.GenerativeModel(m.name)
+        return genai.GenerativeModel("gemini-pro")
     except Exception:
-        pass
-    return genai.GenerativeModel("gemini-1.5-flash")
+        return genai.GenerativeModel("models/gemini-pro")
 
-ai_model = get_working_model()
+ai_model = get_safe_model()
 
 RENDER_EXTERNAL_URL = "https://kiva-ai.onrender.com/"
 webhook_url = f"{RENDER_EXTERNAL_URL}{TOKEN}"
@@ -136,7 +132,6 @@ def handle_ai_messages(message):
         pass
 
     try:
-        global ai_model
         full_prompt = (
             "You are Kiva AI, an advanced professional AI assistant. "
             "Never mention Google, Gemini, or any underlying model provider. "
