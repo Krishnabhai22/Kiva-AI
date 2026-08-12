@@ -17,7 +17,7 @@ TOKEN = os.environ.get("API_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 BOT_NAME = "KIVA AI"
-BOT_VERSION = "3.2 ULTRA PROFESSIONAL"
+BOT_VERSION = "3.3 ULTRA PROFESSIONAL"
 
 DB_FILE = "kiva_ai.db"
 
@@ -33,7 +33,8 @@ if not GEMINI_API_KEY:
 bot = telebot.TeleBot(TOKEN, parse_mode=None)
 genai.configure(api_key=GEMINI_API_KEY)
 
-ai_model = genai.GenerativeModel("gemini-1.5-flash")
+# Using gemini-pro for full compatibility across all environments
+ai_model = genai.GenerativeModel("gemini-pro")
 
 @app.route("/")
 def home():
@@ -109,7 +110,6 @@ def handle_ai_messages(message):
         pass
 
     try:
-        # Professional persona prompt bundled directly with user message to ensure zero errors
         full_prompt = (
             "You are Kiva AI, an advanced professional AI assistant. "
             "Never mention Google, Gemini, or any underlying model provider. "
