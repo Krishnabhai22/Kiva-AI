@@ -5,17 +5,20 @@ import base64
 import asyncio
 import logging
 import threading
-from typing import Optional
+import html
 
 from flask import Flask, jsonify
 from google import genai
 from google.genai import types
+
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
+
 from telegram.constants import ChatAction
+
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -25,8 +28,9 @@ from telegram.ext import (
     filters,
 )
 
+
 # =========================================================
-# CONFIG
+# KIVA AI — CONFIG
 # =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("API_TOKEN")
@@ -34,28 +38,52 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 PORT = int(os.getenv("PORT", "10000"))
 
-# Current Gemini models
-TEXT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+# Internal models
+TEXT_MODEL = os.getenv(
+    "GEMINI_MODEL",
+    "gemini-3.6-flash"
+)
+
 FALLBACK_MODELS = [
     TEXT_MODEL,
     "gemini-3.5-flash",
-    "gemini-3.1-flash-lite",
+    "gemini-3.5-flash-lite",
 ]
 
 IMAGE_MODEL = os.getenv(
     "GEMINI_IMAGE_MODEL",
-    "gemini-3.1-flash-image"
+    "gemini-3.1-flash-lite-image"
 )
 
-# Public branding shown to Telegram users. Keep provider/model IDs private.
-PUBLIC_TEXT_MODEL = "Kiva AI-3.6-flash"
-PUBLIC_IMAGE_MODEL = "Kiva AI-3.1-flash-image"
+# ---------------------------------------------------------
+# PUBLIC NAMES
+# ---------------------------------------------------------
+# Actual provider/model IDs are NEVER shown to users.
+
+PUBLIC_TEXT_ENGINE = "Kiva AI-3.6-flash"
+PUBLIC_IMAGE_ENGINE = "Kiva AI-3.1-flash-image"
+
+# Fast image defaults
+IMAGE_ASPECT_RATIO = os.getenv(
+    "IMAGE_ASPECT_RATIO",
+    "1:1"
+)
+
+IMAGE_SIZE = os.getenv(
+    "IMAGE_SIZE",
+    "1K"
+)
+
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN environment variable is missing.")
+    raise RuntimeError(
+        "BOT_TOKEN (or API_TOKEN) environment variable is missing."
+    )
 
 if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY environment variable is missing.")
+    raise RuntimeError(
+        "GEMINI_API_KEY environment variable is missing."
+    )
 
 
 # =========================================================
@@ -74,17 +102,19 @@ logger = logging.getLogger("KIVA-AI")
 # GEMINI CLIENT
 # =========================================================
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+client = genai.Client(
+    api_key=GEMINI_API_KEY
+)
 
 
 # =========================================================
-# CONVERSATION MEMORY
+# MEMORY
 # =========================================================
 
 # Telegram user_id -> last Gemini interaction ID
 conversation_memory = {}
 
-# Prevent two requests from same user fighting with each other
+# One request at a time per user
 user_locks = {}
 
 
@@ -100,63 +130,78 @@ def get_user_lock(user_id: int):
 # =========================================================
 
 SYSTEM_PROMPT = """
-You are KIVA AI, a premium, modern, highly capable AI assistant inside Telegram.
-
-PERSONALITY:
-- Professional, intelligent, warm and natural.
-- Speak like a high-quality modern AI assistant.
-- Never sound robotic, repetitive or cheap.
-- Understand Hinglish, Hindi, English and mixed-language messages naturally.
-- Reply in the same language/style the user prefers.
-- If the user speaks Hinglish, respond naturally in Hinglish.
-- If the user speaks Hindi, respond naturally in Hindi.
-- If the user speaks English, respond naturally in English.
-
-STYLE:
-- Clean and professional formatting.
-- Use short paragraphs.
-- Use headings when useful.
-- Use bullet points when useful.
-- Use emojis sparingly and professionally.
-- Do not overuse emojis.
-- Do not begin every answer with "Sure!".
-- Do not repeat the user's question unnecessarily.
-- Be direct but helpful.
-- For technical/code questions, provide production-quality answers.
-- For difficult questions, reason carefully before answering.
-- Never pretend that a feature was performed if it was not actually performed.
+You are KIVA AI, a premium modern AI assistant inside Telegram.
 
 IDENTITY:
 - Your name is KIVA AI.
-- You are a premium AI assistant.
-- The user's Telegram display name may be supplied in the prompt.
-- Use their display name naturally when appropriate.
-- Do NOT claim to know a person's legal/real-world identity.
-- Only use information actually available to you.
+- Never reveal internal provider names, model IDs, API names,
+  backend implementation or hidden infrastructure.
+- If someone asks which AI/provider you use, answer simply:
+  "I'm KIVA AI, your AI assistant."
+- Never mention Gemini, Google, model IDs or internal APIs
+  unless the user explicitly asks for technical implementation
+  and it is genuinely necessary.
 
-CAPABILITIES:
-- General conversation
-- Coding and debugging
-- Mathematics
-- Analysis
-- Current information when web search is available
-- Image understanding
-- Document understanding
-- Creative writing
-- Technical explanations
-- Translation
-- Planning
-- Brainstorming
-- Other normal AI-assistant tasks
+LANGUAGE:
+- Understand Hindi, Hinglish and English naturally.
+- Reply in the same language/style as the user.
+- If the user uses Hinglish, use natural Hinglish.
+- If the user uses Hindi, use natural Hindi.
+- If the user uses English, use natural English.
 
-IMPORTANT:
-When current/recent information is needed and Google Search is enabled, use it.
-When code execution is available and useful for calculations/data analysis, use it.
+PERSONALITY:
+- Premium
+- Intelligent
+- Warm
+- Natural
+- Confident
+- Helpful
+- Never robotic
+- Never repetitive
+- Never cheap or childish
+
+TELEGRAM UI STYLE:
+- Responses are displayed inside Telegram.
+- Keep messages clean and easy to scan.
+- Use short paragraphs.
+- Use useful headings.
+- Use concise bullet points.
+- Use emojis only where they improve readability.
+- Never overuse emojis.
+- Never start every response with "Sure!".
+- Never repeat the user's question unnecessarily.
+
+FORMATTING:
+- Do NOT use Markdown headings such as # or ##.
+- Do NOT use **bold** or __bold__.
+- Do NOT use Markdown tables.
+- Do NOT surround normal words with unnecessary symbols.
+- You may naturally structure information with headings and bullets.
+- The bot will convert formatting into Telegram's premium HTML style.
+
+PREMIUM READINGS:
+For astrology, numerology, personality analysis, predictions,
+compatibility or similar readings:
+- Give a polished, structured reading.
+- Use clear sections.
+- Keep the tone personal and engaging.
+- Do not make the response look like raw notes.
+- Avoid excessive disclaimers.
+- Never present entertainment-style predictions as guaranteed facts.
+- Make the answer useful and easy to read.
+
+GENERAL:
+- Answer directly.
+- Think carefully before answering difficult questions.
+- Never pretend a feature was performed if it was not.
+- For coding questions, provide production-quality answers.
+- For current information, use available search tools.
+- For calculations, use available code execution when useful.
 """
 
 
 # =========================================================
-# FLASK HEALTH SERVER FOR RENDER
+# FLASK / RENDER HEALTH SERVER
 # =========================================================
 
 web_app = Flask(__name__)
@@ -168,7 +213,7 @@ def home():
         "name": "KIVA AI",
         "status": "online",
         "service": "Telegram AI Bot",
-        "engine": PUBLIC_TEXT_MODEL,
+        "engine": PUBLIC_TEXT_ENGINE,
     })
 
 
@@ -190,14 +235,10 @@ def run_web_server():
 
 
 # =========================================================
-# HELPERS
+# USER NAME
 # =========================================================
 
 def get_display_name(user) -> str:
-    """
-    Telegram gives us the user's display name.
-    We must not claim it is their legal/real name.
-    """
     first = (user.first_name or "").strip()
     last = (user.last_name or "").strip()
 
@@ -212,13 +253,15 @@ def get_display_name(user) -> str:
     return "there"
 
 
+# =========================================================
+# MESSAGE SPLITTER
+# =========================================================
+
 def split_message(text: str, limit: int = 3900):
-    """
-    Telegram messages have a practical length limit.
-    Split long AI answers safely.
-    """
     if not text:
-        return ["I couldn't generate a response."]
+        return [
+            "I couldn't generate a response."
+        ]
 
     if len(text) <= limit:
         return [text]
@@ -227,15 +270,27 @@ def split_message(text: str, limit: int = 3900):
     remaining = text
 
     while len(remaining) > limit:
-        cut = remaining.rfind("\n", 0, limit)
+
+        cut = remaining.rfind(
+            "\n",
+            0,
+            limit
+        )
 
         if cut < limit // 2:
-            cut = remaining.rfind(" ", 0, limit)
+            cut = remaining.rfind(
+                " ",
+                0,
+                limit
+            )
 
         if cut < limit // 2:
             cut = limit
 
-        chunks.append(remaining[:cut].strip())
+        chunks.append(
+            remaining[:cut].strip()
+        )
+
         remaining = remaining[cut:].strip()
 
     if remaining:
@@ -244,7 +299,161 @@ def split_message(text: str, limit: int = 3900):
     return chunks
 
 
+# =========================================================
+# PREMIUM TELEGRAM FORMATTER
+# =========================================================
+
+def format_telegram_html(text: str) -> str:
+    """
+    Converts common AI Markdown-style formatting into
+    clean Telegram HTML.
+
+    Prevents visible:
+    **bold**
+    ## headings
+    raw markdown
+    """
+
+    if not text:
+        return "I couldn't generate a response."
+
+    text = text.strip()
+
+    code_blocks = []
+
+    # -----------------------------------------------------
+    # Protect code blocks
+    # -----------------------------------------------------
+
+    def stash_code(match):
+
+        code = match.group(1).strip()
+
+        code = html.escape(
+            code,
+            quote=False
+        )
+
+        token = (
+            f"___KIVA_CODE_{len(code_blocks)}___"
+        )
+
+        code_blocks.append(
+            f"<pre>{code}</pre>"
+        )
+
+        return token
+
+    text = re.sub(
+        r"```(?:[A-Za-z0-9_+#.-]+)?\s*\n?(.*?)```",
+        stash_code,
+        text,
+        flags=re.S,
+    )
+
+    # -----------------------------------------------------
+    # Escape HTML
+    # -----------------------------------------------------
+
+    text = html.escape(
+        text,
+        quote=False
+    )
+
+    # -----------------------------------------------------
+    # Headings
+    # -----------------------------------------------------
+
+    text = re.sub(
+        r"(?m)^\s*#{1,6}\s+(.+?)\s*$",
+        r"<b>\1</b>",
+        text,
+    )
+
+    # -----------------------------------------------------
+    # Bold
+    # -----------------------------------------------------
+
+    text = re.sub(
+        r"\*\*(.+?)\*\*",
+        r"<b>\1</b>",
+        text,
+    )
+
+    text = re.sub(
+        r"__(.+?)__",
+        r"<b>\1</b>",
+        text,
+    )
+
+    # -----------------------------------------------------
+    # Italic
+    # -----------------------------------------------------
+
+    text = re.sub(
+        r"(?<!\*)\*([^*\n]+)\*(?!\*)",
+        r"<i>\1</i>",
+        text,
+    )
+
+    text = re.sub(
+        r"(?<!_)_([^_\n]+)_(?!_)",
+        r"<i>\1</i>",
+        text,
+    )
+
+    # -----------------------------------------------------
+    # Inline code
+    # -----------------------------------------------------
+
+    text = re.sub(
+        r"`([^`\n]+)`",
+        r"<code>\1</code>",
+        text,
+    )
+
+    # -----------------------------------------------------
+    # Bullets
+    # -----------------------------------------------------
+
+    text = re.sub(
+        r"(?m)^\s*[-*]\s+",
+        "• ",
+        text,
+    )
+
+    # -----------------------------------------------------
+    # Clean excessive blank lines
+    # -----------------------------------------------------
+
+    text = re.sub(
+        r"\n{3,}",
+        "\n\n",
+        text,
+    )
+
+    text = text.strip()
+
+    # -----------------------------------------------------
+    # Restore code blocks
+    # -----------------------------------------------------
+
+    for i, block in enumerate(code_blocks):
+
+        text = text.replace(
+            f"___KIVA_CODE_{i}___",
+            block,
+        )
+
+    return text or "I couldn't generate a response."
+
+
+# =========================================================
+# WEB SEARCH DETECTION
+# =========================================================
+
 def needs_web_search(text: str) -> bool:
+
     text_lower = text.lower()
 
     keywords = [
@@ -264,10 +473,18 @@ def needs_web_search(text: str) -> bool:
         "2026",
     ]
 
-    return any(keyword in text_lower for keyword in keywords)
+    return any(
+        keyword in text_lower
+        for keyword in keywords
+    )
 
+
+# =========================================================
+# CODE EXECUTION DETECTION
+# =========================================================
 
 def needs_code_execution(text: str) -> bool:
+
     text_lower = text.lower()
 
     keywords = [
@@ -284,14 +501,32 @@ def needs_code_execution(text: str) -> bool:
         "python output",
     ]
 
-    return any(keyword in text_lower for keyword in keywords)
+    return any(
+        keyword in text_lower
+        for keyword in keywords
+    )
 
+
+# =========================================================
+# URL DETECTION
+# =========================================================
 
 def contains_url(text: str) -> bool:
-    return bool(re.search(r"https?://\S+", text))
 
+    return bool(
+        re.search(
+            r"https?://\S+",
+            text
+        )
+    )
+
+
+# =========================================================
+# IMAGE REQUEST DETECTION
+# =========================================================
 
 def is_image_request(text: str) -> bool:
+
     text_lower = text.lower().strip()
 
     prefixes = [
@@ -300,7 +535,10 @@ def is_image_request(text: str) -> bool:
         "/imagine",
     ]
 
-    if any(text_lower.startswith(p) for p in prefixes):
+    if any(
+        text_lower.startswith(prefix)
+        for prefix in prefixes
+    ):
         return True
 
     phrases = [
@@ -320,17 +558,32 @@ def is_image_request(text: str) -> bool:
         "tasveer banao",
         "picture bana",
         "picture banao",
+        "photo create",
+        "photo generate",
+        "image create",
     ]
 
-    return any(p in text_lower for p in phrases)
+    return any(
+        phrase in text_lower
+        for phrase in phrases
+    )
 
 
 def clean_image_prompt(text: str) -> str:
+
     text = text.strip()
 
-    for prefix in ["/image", "/generate", "/imagine"]:
+    for prefix in [
+        "/image",
+        "/generate",
+        "/imagine",
+    ]:
+
         if text.lower().startswith(prefix):
-            text = text[len(prefix):].strip()
+
+            text = text[
+                len(prefix):
+            ].strip()
 
     return text
 
@@ -339,26 +592,33 @@ def clean_image_prompt(text: str) -> str:
 # TYPING INDICATOR
 # =========================================================
 
-async def typing_loop(bot, chat_id: int, stop_event: asyncio.Event):
-    """
-    Telegram's typing status lasts only a few seconds,
-    so refresh it while Gemini is processing.
-    """
+async def typing_loop(
+    bot,
+    chat_id: int,
+    stop_event: asyncio.Event
+):
+
     try:
+
         while not stop_event.is_set():
+
             try:
+
                 await bot.send_chat_action(
                     chat_id=chat_id,
                     action=ChatAction.TYPING,
                 )
+
             except Exception:
                 pass
 
             try:
+
                 await asyncio.wait_for(
                     stop_event.wait(),
                     timeout=4.0,
                 )
+
             except asyncio.TimeoutError:
                 pass
 
@@ -367,7 +627,7 @@ async def typing_loop(bot, chat_id: int, stop_event: asyncio.Event):
 
 
 # =========================================================
-# GEMINI TEXT GENERATION
+# TEXT GENERATION
 # =========================================================
 
 async def generate_text(
@@ -376,27 +636,38 @@ async def generate_text(
     display_name: str,
     extra_input=None,
 ):
-    previous_id = conversation_memory.get(user_id)
+
+    previous_id = conversation_memory.get(
+        user_id
+    )
 
     tools = []
 
     if needs_web_search(prompt):
-        tools.append({"type": "google_search"})
+        tools.append(
+            {"type": "google_search"}
+        )
 
     if needs_code_execution(prompt):
-        tools.append({"type": "code_execution"})
+        tools.append(
+            {"type": "code_execution"}
+        )
 
     if contains_url(prompt):
-        tools.append({"type": "url_context"})
+        tools.append(
+            {"type": "url_context"}
+        )
 
     user_context = f"""
-Telegram user's display name: {display_name}
+Telegram user's display name:
+{display_name}
 
 User message:
 {prompt}
 """
 
     if extra_input:
+
         input_data = [
             extra_input,
             {
@@ -404,6 +675,7 @@ User message:
                 "text": user_context,
             },
         ]
+
     else:
         input_data = user_context
 
@@ -412,6 +684,7 @@ User message:
     for model in FALLBACK_MODELS:
 
         try:
+
             kwargs = {
                 "model": model,
                 "input": input_data,
@@ -426,105 +699,177 @@ User message:
                 kwargs["tools"] = tools
 
             if previous_id:
-                kwargs["previous_interaction_id"] = previous_id
+
+                kwargs[
+                    "previous_interaction_id"
+                ] = previous_id
 
             interaction = await asyncio.to_thread(
-                lambda: client.interactions.create(**kwargs)
+                lambda: client.interactions.create(
+                    **kwargs
+                )
             )
 
             answer = interaction.output_text
 
             if not answer:
-                answer = "I completed the request, but there was no text response."
 
-            # Save state only after successful response
-            conversation_memory[user_id] = interaction.id
+                answer = (
+                    "I completed the request, "
+                    "but there was no text response."
+                )
+
+            conversation_memory[
+                user_id
+            ] = interaction.id
 
             return answer
 
         except Exception as exc:
+
             last_error = exc
 
             logger.exception(
-                "Gemini model failed: %s | %s",
+                "Text model failed: %s",
                 model,
-                exc,
             )
 
-            # If previous conversation state caused the problem,
-            # retry the request without it.
+            # Retry without old conversation state
             if previous_id:
-                try:
-                    kwargs.pop("previous_interaction_id", None)
 
-                    interaction = await asyncio.to_thread(
-                        lambda: client.interactions.create(**kwargs)
+                try:
+
+                    kwargs.pop(
+                        "previous_interaction_id",
+                        None,
                     )
 
-                    answer = interaction.output_text
+                    interaction = await asyncio.to_thread(
+                        lambda: client.interactions.create(
+                            **kwargs
+                        )
+                    )
+
+                    answer = (
+                        interaction.output_text
+                    )
 
                     if answer:
-                        conversation_memory[user_id] = interaction.id
+
+                        conversation_memory[
+                            user_id
+                        ] = interaction.id
+
                         return answer
 
                 except Exception as retry_exc:
+
                     last_error = retry_exc
 
     raise RuntimeError(
-        f"All Gemini models failed. Last error: {last_error}"
+        f"All text models failed: {last_error}"
     )
 
 
 # =========================================================
-# GEMINI IMAGE GENERATION
+# IMAGE GENERATION
 # =========================================================
 
 async def generate_image(prompt: str):
-    """Generate an image directly with the Gemini image model.
+    """Generate an image with Nano Banana 2 Lite.
 
-    IMPORTANT: google-genai 2.13.0 rejects the newer response_format
-    field inside GenerateContentConfig. Keep the image request minimal
-    and request IMAGE-only output. The model defaults to 1K for speed.
+    Uses the Gemini Interactions API image response format.
+    This avoids passing response_format into GenerateContentConfig,
+    which caused the previous validation error.
     """
     prompt = prompt.strip()
 
     if not prompt:
-        raise ValueError("Image prompt is empty.")
-
-    def call_image_api():
-        return client.models.generate_content(
-            model=IMAGE_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_modalities=["IMAGE"],
-            ),
+        raise ValueError(
+            "Image prompt is empty."
         )
 
-    response = await asyncio.to_thread(call_image_api)
+    def call_image_api():
+        return client.interactions.create(
+            model=IMAGE_MODEL,
+            input=prompt,
+            response_format={
+                "type": "image",
+                "mime_type": "image/jpeg",
+                "aspect_ratio": IMAGE_ASPECT_RATIO,
+                "image_size": "1K",
+            },
+        )
 
-    # Gemini returns generated image data as an inline_data part.
-    for part in response.parts:
-        inline_data = getattr(part, "inline_data", None)
-        if inline_data is not None:
-            data = getattr(inline_data, "data", None)
-            if data:
-                if isinstance(data, str):
-                    return base64.b64decode(data)
-                return bytes(data)
+    last_error = None
 
-    raise RuntimeError("Image model returned no image data.")
+    for attempt in range(2):
+        try:
+            response = await asyncio.to_thread(
+                call_image_api
+            )
+
+            output_image = getattr(
+                response,
+                "output_image",
+                None,
+            )
+
+            if output_image is not None:
+                data = getattr(
+                    output_image,
+                    "data",
+                    None,
+                )
+
+                if data:
+                    if isinstance(data, str):
+                        return base64.b64decode(data)
+                    return bytes(data)
+
+            # Compatibility fallback for SDK response shapes.
+            for item in getattr(response, "outputs", []) or []:
+                data = getattr(item, "data", None)
+                if data:
+                    if isinstance(data, str):
+                        return base64.b64decode(data)
+                    return bytes(data)
+
+            raise RuntimeError(
+                "Image model returned no image data."
+            )
+
+        except Exception as exc:
+            last_error = exc
+            logger.exception(
+                "Image generation attempt %s failed: %s",
+                attempt + 1,
+                exc,
+            )
+
+            if attempt == 0:
+                await asyncio.sleep(0.7)
+
+    raise RuntimeError(
+        f"Image generation failed: {last_error}"
+    )
 
 
 # =========================================================
-# START
+# /START
 # =========================================================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
     user = update.effective_user
 
     name = get_display_name(user)
 
     keyboard = [
+
         [
             InlineKeyboardButton(
                 "💬 Start Chat",
@@ -535,6 +880,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 callback_data="image",
             ),
         ],
+
         [
             InlineKeyboardButton(
                 "🧠 New Conversation",
@@ -548,18 +894,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
 
     message = f"""
-✨ <b>Welcome to KIVA AI</b>, {name}!
+✨ <b>Welcome to KIVA AI</b>, {name}
 
 ━━━━━━━━━━━━━━━━━━
 
-Your personal <b>next-generation AI assistant</b> is ready.
+Your premium AI assistant is ready.
 
 🧠 Intelligent conversations
 ⚡ Fast responses
-🌐 Live web information
+🌐 Live information
 💻 Coding & problem solving
 🖼️ Image understanding
-🎨 AI image generation
+🎨 Image creation
 📄 Document & PDF analysis
 🎙️ Audio understanding
 🌍 Hindi • Hinglish • English
@@ -568,43 +914,56 @@ Your personal <b>next-generation AI assistant</b> is ready.
 
 <b>KIVA AI is ready whenever you are.</b>
 
-Just type your message below and let's get started. 🚀
+Just type your message and let's get started. 🚀
 """
 
     await update.message.reply_text(
         message,
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=InlineKeyboardMarkup(
+            keyboard
+        ),
     )
 
 
 # =========================================================
-# HELP
+# /HELP
 # =========================================================
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = """
-✨ KIVA AI — Help
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
-<b>Chat</b>
+    text = """
+✨ <b>KIVA AI — Help</b>
+
+<b>💬 Chat</b>
 Simply type anything and KIVA AI will respond.
 
-<b>Image generation</b>
+<b>🎨 Image Creation</b>
 Use:
-<code>/image a futuristic city at night</code>
 
-You can also simply say:
-"Ek futuristic city ki image banao."
+<code>/image a cinematic futuristic city at night</code>
+
+Ya normal language mein bolo:
+
+<i>Ek futuristic city ki image banao.</i>
 
 <b>Commands</b>
-/start — Welcome screen
+
+/start — Open KIVA AI
 /help — Help
 /image — Generate an image
-/clear — Start a fresh conversation
+/clear — Start fresh
 /status — Bot status
 
-<b>Tip:</b>
-You can speak in Hindi, Hinglish or English naturally.
+<b>🌍 Languages</b>
+Hindi • Hinglish • English
+
+<b>✨ Tip</b>
+Aap naturally baat kar sakte ho.
+KIVA AI automatically request samajhne ki koshish karega.
 """
 
     await update.message.reply_text(
@@ -614,35 +973,48 @@ You can speak in Hindi, Hinglish or English naturally.
 
 
 # =========================================================
-# CLEAR MEMORY
+# /CLEAR
 # =========================================================
 
-async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def clear_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
     user_id = update.effective_user.id
 
-    conversation_memory.pop(user_id, None)
+    conversation_memory.pop(
+        user_id,
+        None
+    )
 
     await update.message.reply_text(
         "🧠 <b>Fresh conversation ready.</b>\n\n"
-        "Purani chat context clear kar di gayi hai. "
-        "Ab hum bilkul fresh start kar sakte hain. ✨",
+        "Purani conversation context clear kar di gayi hai.\n"
+        "Ab hum fresh start kar sakte hain. ✨",
         parse_mode="HTML",
     )
 
 
 # =========================================================
-# STATUS
+# /STATUS
 # =========================================================
 
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"""
+async def status_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    # IMPORTANT:
+    # Never expose actual Gemini/provider/model IDs.
+
+    text = """
 🟢 <b>KIVA AI is operational</b>
 
 ━━━━━━━━━━━━━━━━━━
 
-⚡ Engine: <code>{PUBLIC_TEXT_MODEL}</code>
-🎨 Image: <code>{PUBLIC_IMAGE_MODEL}</code>
+⚡ Engine: <code>Kiva AI-3.6-flash</code>
+🎨 Image: <code>Kiva AI-3.1-flash-image</code>
 🧠 Memory: Active
 🌐 Web Search: Available
 💻 Code Execution: Available
@@ -651,8 +1023,11 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 ━━━━━━━━━━━━━━━━━━
 
-KIVA AI is ready. 🚀
-""",
+<b>Everything is ready.</b> 🚀
+"""
+
+    await update.message.reply_text(
+        text,
         parse_mode="HTML",
     )
 
@@ -661,16 +1036,24 @@ KIVA AI is ready. 🚀
 # IMAGE COMMAND
 # =========================================================
 
-async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    prompt = " ".join(context.args).strip()
+async def image_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    prompt = " ".join(
+        context.args
+    ).strip()
 
     if not prompt:
+
         await update.message.reply_text(
             "🎨 <b>Image Generator</b>\n\n"
             "Example:\n"
             "<code>/image a cinematic futuristic city at night</code>",
             parse_mode="HTML",
         )
+
         return
 
     stop_event = asyncio.Event()
@@ -684,28 +1067,40 @@ async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
+
         await update.message.reply_text(
-            "🎨 Creating your image...\n\n"
-            "Please wait a moment. ✨"
+            "🎨 <b>Creating your image…</b>\n\n"
+            "Turning your prompt into a visual. ✨",
+            parse_mode="HTML",
         )
 
-        image_bytes = await generate_image(prompt)
+        image_bytes = await generate_image(
+            prompt
+        )
 
         await update.message.reply_photo(
-            photo=io.BytesIO(image_bytes),
-            caption="✨ Generated by KIVA AI",
+            photo=io.BytesIO(
+                image_bytes
+            ),
+            caption="✨ KIVA AI",
         )
 
-    except Exception as exc:
-        logger.exception("Image generation failed")
+    except Exception:
+
+        logger.exception(
+            "Image generation failed"
+        )
 
         await update.message.reply_text(
-            "⚠️ Image generation is temporarily unavailable.\n\n"
-            "Please try again in a few seconds."
+            "⚠️ <b>Image generation failed.</b>\n\n"
+            "Please try again in a few seconds.",
+            parse_mode="HTML",
         )
 
     finally:
+
         stop_event.set()
+
         typing_task.cancel()
 
 
@@ -713,12 +1108,21 @@ async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # NORMAL TEXT MESSAGE
 # =========================================================
 
-async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
+async def text_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if (
+        not update.message
+        or not update.message.text
+    ):
         return
 
     user = update.effective_user
+
     user_id = user.id
+
     chat_id = update.effective_chat.id
 
     prompt = update.message.text.strip()
@@ -726,14 +1130,22 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not prompt:
         return
 
-    # Image request
+    # -----------------------------------------------------
+    # IMAGE REQUEST
+    # -----------------------------------------------------
+
     if is_image_request(prompt):
-        image_prompt = clean_image_prompt(prompt)
+
+        image_prompt = clean_image_prompt(
+            prompt
+        )
 
         if not image_prompt:
+
             await update.message.reply_text(
                 "🎨 Bataiye image mein kya create karna hai?"
             )
+
             return
 
         stop_event = asyncio.Event()
@@ -747,36 +1159,55 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         try:
+
             await update.message.reply_text(
-                "🎨 <b>Creating your image...</b>\n\n"
-                "Aapke prompt ko image mein convert kar raha hoon. ✨",
+                "🎨 <b>Creating your image…</b>\n\n"
+                "Aapke prompt ko visual mein convert kar raha hoon. ✨",
                 parse_mode="HTML",
             )
 
-            image_bytes = await generate_image(image_prompt)
+            image_bytes = await generate_image(
+                image_prompt
+            )
 
             await update.message.reply_photo(
-                photo=io.BytesIO(image_bytes),
-                caption="✨ Created by KIVA AI",
+                photo=io.BytesIO(
+                    image_bytes
+                ),
+                caption="✨ KIVA AI",
             )
 
         except Exception:
-            logger.exception("Image request failed")
+
+            logger.exception(
+                "Image request failed"
+            )
 
             await update.message.reply_text(
-                "⚠️ Image generation temporarily unavailable.\n"
-                "Please try again."
+                "⚠️ <b>Image generation temporarily unavailable.</b>\n\n"
+                "Please try again.",
+                parse_mode="HTML",
             )
 
         finally:
+
             stop_event.set()
+
             typing_task.cancel()
 
         return
 
-    display_name = get_display_name(user)
+    # -----------------------------------------------------
+    # NORMAL AI CHAT
+    # -----------------------------------------------------
 
-    lock = get_user_lock(user_id)
+    display_name = get_display_name(
+        user
+    )
+
+    lock = get_user_lock(
+        user_id
+    )
 
     async with lock:
 
@@ -791,28 +1222,58 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         try:
+
             answer = await generate_text(
                 user_id=user_id,
                 prompt=prompt,
                 display_name=display_name,
             )
 
-            for chunk in split_message(answer):
-                await update.message.reply_text(chunk)
+            formatted_answer = (
+                format_telegram_html(
+                    answer
+                )
+            )
+
+            for chunk in split_message(
+                formatted_answer
+            ):
+
+                try:
+
+                    await update.message.reply_text(
+                        chunk,
+                        parse_mode="HTML",
+                    )
+
+                except Exception:
+
+                    # Safe fallback
+                    await update.message.reply_text(
+                        re.sub(
+                            r"<[^>]+>",
+                            "",
+                            chunk,
+                        )
+                    )
 
         except Exception as exc:
+
             logger.exception(
                 "Message processing failed: %s",
                 exc,
             )
 
             await update.message.reply_text(
-                "⚠️ KIVA AI temporarily unavailable.\n\n"
-                "Please try again in a few seconds."
+                "⚠️ <b>KIVA AI temporarily unavailable.</b>\n\n"
+                "Please try again in a few seconds.",
+                parse_mode="HTML",
             )
 
         finally:
+
             stop_event.set()
+
             typing_task.cancel()
 
 
@@ -820,31 +1281,38 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # PHOTO / IMAGE UNDERSTANDING
 # =========================================================
 
-async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def photo_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
     user = update.effective_user
+
     user_id = user.id
+
     chat_id = update.effective_chat.id
 
     caption = (
         update.message.caption
-        or "Analyze this image carefully and explain what you see."
+        or
+        "Analyze this image carefully and explain what you see."
     )
 
     photo = update.message.photo[-1]
 
-    tg_file = await context.bot.get_file(photo.file_id)
+    tg_file = await context.bot.get_file(
+        photo.file_id
+    )
 
     image_data = await tg_file.download_as_bytearray()
 
-    mime_type = "image/jpeg"
-
     extra_input = {
         "type": "image",
-        "data": base64.b64encode(bytes(image_data)).decode("utf-8"),
-        "mime_type": mime_type,
+        "data": base64.b64encode(
+            bytes(image_data)
+        ).decode("utf-8"),
+        "mime_type": "image/jpeg",
     }
-
-    display_name = get_display_name(user)
 
     stop_event = asyncio.Event()
 
@@ -857,18 +1325,48 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
+
         answer = await generate_text(
             user_id=user_id,
             prompt=caption,
-            display_name=display_name,
+            display_name=get_display_name(
+                user
+            ),
             extra_input=extra_input,
         )
 
-        for chunk in split_message(answer):
-            await update.message.reply_text(chunk)
+        formatted_answer = (
+            format_telegram_html(
+                answer
+            )
+        )
+
+        for chunk in split_message(
+            formatted_answer
+        ):
+
+            try:
+
+                await update.message.reply_text(
+                    chunk,
+                    parse_mode="HTML",
+                )
+
+            except Exception:
+
+                await update.message.reply_text(
+                    re.sub(
+                        r"<[^>]+>",
+                        "",
+                        chunk,
+                    )
+                )
 
     except Exception:
-        logger.exception("Image understanding failed")
+
+        logger.exception(
+            "Image understanding failed"
+        )
 
         await update.message.reply_text(
             "⚠️ I couldn't analyze that image right now.\n"
@@ -876,7 +1374,9 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     finally:
+
         stop_event.set()
+
         typing_task.cancel()
 
 
@@ -884,7 +1384,11 @@ async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # PDF / DOCUMENT UNDERSTANDING
 # =========================================================
 
-async def document_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def document_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
     document = update.message.document
 
     if not document:
@@ -892,28 +1396,37 @@ async def document_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     mime_type = document.mime_type or ""
 
-    # Currently focus on PDFs for native document understanding
     if mime_type != "application/pdf":
+
         await update.message.reply_text(
             "📄 Abhi document understanding ke liye PDF support enabled hai.\n\n"
             "Please PDF upload karke uske saath apna question bhejiye."
         )
+
         return
 
-    if document.file_size and document.file_size > 50 * 1024 * 1024:
+    if (
+        document.file_size
+        and document.file_size > 50 * 1024 * 1024
+    ):
+
         await update.message.reply_text(
             "⚠️ Ye PDF 50 MB se badi hai.\n"
             "Please smaller PDF upload karein."
         )
+
         return
 
     user = update.effective_user
+
     user_id = user.id
+
     chat_id = update.effective_chat.id
 
     question = (
         update.message.caption
-        or "Summarize this PDF and explain its important points."
+        or
+        "Summarize this PDF and explain its important points."
     )
 
     stop_event = asyncio.Event()
@@ -927,27 +1440,62 @@ async def document_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
-        tg_file = await context.bot.get_file(document.file_id)
+
+        tg_file = await context.bot.get_file(
+            document.file_id
+        )
+
         pdf_data = await tg_file.download_as_bytearray()
 
         extra_input = {
             "type": "document",
-            "data": base64.b64encode(bytes(pdf_data)).decode("utf-8"),
+            "data": base64.b64encode(
+                bytes(pdf_data)
+            ).decode("utf-8"),
             "mime_type": "application/pdf",
         }
 
         answer = await generate_text(
             user_id=user_id,
             prompt=question,
-            display_name=get_display_name(user),
+            display_name=get_display_name(
+                user
+            ),
             extra_input=extra_input,
         )
 
-        for chunk in split_message(answer):
-            await update.message.reply_text(chunk)
+        formatted_answer = (
+            format_telegram_html(
+                answer
+            )
+        )
+
+        for chunk in split_message(
+            formatted_answer
+        ):
+
+            try:
+
+                await update.message.reply_text(
+                    chunk,
+                    parse_mode="HTML",
+                )
+
+            except Exception:
+
+                await update.message.reply_text(
+                    re.sub(
+                        r"<[^>]+>",
+                        "",
+                        chunk,
+                    )
+                )
 
     except Exception:
-        logger.exception("PDF processing failed")
+
+        logger.exception(
+            "PDF processing failed"
+        )
 
         await update.message.reply_text(
             "⚠️ PDF process nahi ho paayi.\n"
@@ -955,22 +1503,30 @@ async def document_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     finally:
+
         stop_event.set()
+
         typing_task.cancel()
 
 
 # =========================================================
-# VOICE / AUDIO UNDERSTANDING
+# VOICE / AUDIO
 # =========================================================
 
-async def voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def voice_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
     voice = update.message.voice
 
     if not voice:
         return
 
     user = update.effective_user
+
     user_id = user.id
+
     chat_id = update.effective_chat.id
 
     stop_event = asyncio.Event()
@@ -984,31 +1540,66 @@ async def voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
-        tg_file = await context.bot.get_file(voice.file_id)
+
+        tg_file = await context.bot.get_file(
+            voice.file_id
+        )
 
         audio_data = await tg_file.download_as_bytearray()
 
         extra_input = {
             "type": "audio",
-            "data": base64.b64encode(bytes(audio_data)).decode("utf-8"),
+            "data": base64.b64encode(
+                bytes(audio_data)
+            ).decode("utf-8"),
             "mime_type": "audio/ogg",
         }
 
         answer = await generate_text(
             user_id=user_id,
             prompt=(
-                "Listen to this voice message and respond naturally. "
-                "If it contains a question, answer it."
+                "Listen to this voice message and "
+                "respond naturally. If it contains a "
+                "question, answer it."
             ),
-            display_name=get_display_name(user),
+            display_name=get_display_name(
+                user
+            ),
             extra_input=extra_input,
         )
 
-        for chunk in split_message(answer):
-            await update.message.reply_text(chunk)
+        formatted_answer = (
+            format_telegram_html(
+                answer
+            )
+        )
+
+        for chunk in split_message(
+            formatted_answer
+        ):
+
+            try:
+
+                await update.message.reply_text(
+                    chunk,
+                    parse_mode="HTML",
+                )
+
+            except Exception:
+
+                await update.message.reply_text(
+                    re.sub(
+                        r"<[^>]+>",
+                        "",
+                        chunk,
+                    )
+                )
 
     except Exception:
-        logger.exception("Audio processing failed")
+
+        logger.exception(
+            "Audio processing failed"
+        )
 
         await update.message.reply_text(
             "⚠️ Voice message process nahi ho paaya.\n"
@@ -1016,15 +1607,21 @@ async def voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     finally:
+
         stop_event.set()
+
         typing_task.cancel()
 
 
 # =========================================================
-# BUTTONS
+# BUTTON HANDLER
 # =========================================================
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
     query = update.callback_query
 
     await query.answer()
@@ -1033,7 +1630,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "clear":
 
-        conversation_memory.pop(user_id, None)
+        conversation_memory.pop(
+            user_id,
+            None
+        )
 
         await query.message.reply_text(
             "🧠 <b>Fresh conversation started.</b>\n\n"
@@ -1056,8 +1656,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await query.message.reply_text(
             "✨ <b>KIVA AI</b>\n\n"
-            "Bas message type karo — KIVA AI automatically samajhne ki "
-            "koshish karega ki aapko kya chahiye.\n\n"
+            "Bas message type karo — KIVA AI automatically "
+            "samajhne ki koshish karega ki aapko kya chahiye.\n\n"
             "🎨 Image: /image\n"
             "🧠 New chat: /clear\n"
             "📊 Status: /status\n"
@@ -1078,7 +1678,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ERROR HANDLER
 # =========================================================
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
     logger.error(
         "Telegram error: %s",
         context.error,
@@ -1090,27 +1694,56 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # POST INIT
 # =========================================================
 
-async def post_init(application: Application):
+async def post_init(
+    application: Application
+):
 
     await application.bot.set_my_commands([
-        ("start", "Open KIVA AI"),
-        ("help", "How to use KIVA AI"),
-        ("image", "Generate an AI image"),
-        ("clear", "Start a new conversation"),
-        ("status", "Show bot status"),
+
+        (
+            "start",
+            "Open KIVA AI"
+        ),
+
+        (
+            "help",
+            "How to use KIVA AI"
+        ),
+
+        (
+            "image",
+            "Generate an AI image"
+        ),
+
+        (
+            "clear",
+            "Start a new conversation"
+        ),
+
+        (
+            "status",
+            "Show bot status"
+        ),
+
     ])
 
     try:
+
         await application.bot.set_my_short_description(
             "KIVA AI — your premium intelligent AI assistant."
         )
 
         await application.bot.set_my_description(
-            "KIVA AI is a professional AI assistant for chat, coding, "
-            "analysis, image generation, documents and more."
+            "KIVA AI is a premium AI assistant for chat, "
+            "coding, analysis, image creation, documents "
+            "and more."
         )
+
     except Exception:
-        logger.exception("Could not update bot profile")
+
+        logger.exception(
+            "Could not update bot profile"
+        )
 
 
 # =========================================================
@@ -1119,15 +1752,30 @@ async def post_init(application: Application):
 
 def main():
 
-    logger.info("Starting KIVA AI...")
-    logger.info("Text model: %s", TEXT_MODEL)
-    logger.info("Image model: %s", IMAGE_MODEL)
+    logger.info(
+        "Starting KIVA AI..."
+    )
 
-    # Start Render health server
+    logger.info(
+        "Text model configured."
+    )
+
+    logger.info(
+        "Image model configured."
+    )
+
+    # -----------------------------------------------------
+    # Render health server
+    # -----------------------------------------------------
+
     threading.Thread(
         target=run_web_server,
         daemon=True,
     ).start()
+
+    # -----------------------------------------------------
+    # Telegram application
+    # -----------------------------------------------------
 
     application = (
         Application.builder()
@@ -1137,33 +1785,59 @@ def main():
         .build()
     )
 
+    # -----------------------------------------------------
     # Commands
+    # -----------------------------------------------------
+
     application.add_handler(
-        CommandHandler("start", start)
+        CommandHandler(
+            "start",
+            start
+        )
     )
 
     application.add_handler(
-        CommandHandler("help", help_command)
+        CommandHandler(
+            "help",
+            help_command
+        )
     )
 
     application.add_handler(
-        CommandHandler("image", image_command)
+        CommandHandler(
+            "image",
+            image_command
+        )
     )
 
     application.add_handler(
-        CommandHandler("clear", clear_command)
+        CommandHandler(
+            "clear",
+            clear_command
+        )
     )
 
     application.add_handler(
-        CommandHandler("status", status_command)
+        CommandHandler(
+            "status",
+            status_command
+        )
     )
 
+    # -----------------------------------------------------
     # Buttons
+    # -----------------------------------------------------
+
     application.add_handler(
-        CallbackQueryHandler(button_handler)
+        CallbackQueryHandler(
+            button_handler
+        )
     )
 
-    # Images
+    # -----------------------------------------------------
+    # Photos
+    # -----------------------------------------------------
+
     application.add_handler(
         MessageHandler(
             filters.PHOTO,
@@ -1171,7 +1845,10 @@ def main():
         )
     )
 
-    # PDFs / documents
+    # -----------------------------------------------------
+    # Documents
+    # -----------------------------------------------------
+
     application.add_handler(
         MessageHandler(
             filters.Document.ALL,
@@ -1179,7 +1856,10 @@ def main():
         )
     )
 
+    # -----------------------------------------------------
     # Voice
+    # -----------------------------------------------------
+
     application.add_handler(
         MessageHandler(
             filters.VOICE,
@@ -1187,7 +1867,10 @@ def main():
         )
     )
 
+    # -----------------------------------------------------
     # Normal text
+    # -----------------------------------------------------
+
     application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
@@ -1195,9 +1878,17 @@ def main():
         )
     )
 
-    application.add_error_handler(error_handler)
+    # -----------------------------------------------------
+    # Errors
+    # -----------------------------------------------------
 
-    logger.info("KIVA AI is starting polling...")
+    application.add_error_handler(
+        error_handler
+    )
+
+    logger.info(
+        "KIVA AI is starting polling..."
+    )
 
     application.run_polling(
         drop_pending_updates=True,
@@ -1205,6 +1896,9 @@ def main():
     )
 
 
+# =========================================================
+# RUN
+# =========================================================
+
 if __name__ == "__main__":
     main()
-    
