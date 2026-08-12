@@ -28,7 +28,7 @@ from telegram.ext import (
 # CONFIG
 # =========================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("API_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 PORT = int(os.getenv("PORT", "10000"))
