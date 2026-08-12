@@ -6,6 +6,8 @@ import asyncio
 import logging
 import threading
 import html
+import sqlite3
+import time
 
 from flask import Flask, jsonify
 from google import genai
@@ -23,7 +25,6 @@ from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -52,8 +53,19 @@ FALLBACK_MODELS = [
 
 IMAGE_MODEL = os.getenv(
     "GEMINI_IMAGE_MODEL",
-    "gemini-3.1-flash-lite-image"
-)
+    "gemini-3.1-flash-image"
+).strip()
+
+# Fallback image models keep image generation resilient if the primary
+# model is temporarily unavailable or a deployment still has an older
+# image-model environment variable configured.
+IMAGE_FALLBACK_MODELS = [
+    IMAGE_MODEL,
+    "gemini-3.1-flash-image",
+    "gemini-3.1-flash-lite-image",
+    "gemini-2.5-flash-image",
+]
+IMAGE_FALLBACK_MODELS = list(dict.fromkeys(IMAGE_FALLBACK_MODELS))
 
 # ---------------------------------------------------------
 # PUBLIC NAMES
@@ -73,6 +85,46 @@ IMAGE_SIZE = os.getenv(
     "IMAGE_SIZE",
     "1K"
 )
+
+# ---------------------------------------------------------
+# OWNER
+# ---------------------------------------------------------
+
+OWNER_NAME = "Krishna Singh"
+OWNER_USERNAME = "qrishna"
+OWNER_URL = "https://t.me/qrishna"
+
+# ---------------------------------------------------------
+# CHAT CLEANUP STORAGE
+# ---------------------------------------------------------
+# Telegram can delete incoming messages in private chats and outgoing
+# bot messages. We persist message IDs so "clean the chat" can remove
+# messages that KIVA AI has seen, even after a process restart.
+MESSAGE_DB = os.getenv("MESSAGE_DB", "kiva_messages.db")
+MESSAGE_RETENTION_SECONDS = 48 * 60 * 60
+CLEAN_PRIVATE_CHAT_SCAN_LIMIT = int(
+    os.getenv("CLEAN_PRIVATE_CHAT_SCAN_LIMIT", "5000")
+)
+
+def init_message_db():
+    with sqlite3.connect(MESSAGE_DB) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS message_history (
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (chat_id, message_id)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_message_history_chat "
+            "ON message_history(chat_id, created_at)"
+        )
+        conn.commit()
+
+init_message_db()
 
 
 if not BOT_TOKEN:
@@ -251,6 +303,175 @@ def get_display_name(user) -> str:
         return f"@{user.username}"
 
     return "there"
+
+
+# =========================================================
+# MESSAGE TRACKING / CHAT CLEANUP
+# =========================================================
+
+def remember_message(chat_id: int, message_id: int):
+    try:
+        with sqlite3.connect(MESSAGE_DB) as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO message_history
+                (chat_id, message_id, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (chat_id, message_id, int(time.time())),
+            )
+            conn.commit()
+    except Exception:
+        logger.exception("Could not remember Telegram message")
+
+
+async def track_incoming_message(message):
+    if message:
+        remember_message(message.chat_id, message.message_id)
+
+
+async def tracked_reply_text(message, *args, **kwargs):
+    sent = await message.reply_text(*args, **kwargs)
+    remember_message(sent.chat_id, sent.message_id)
+    return sent
+
+
+async def tracked_reply_photo(message, *args, **kwargs):
+    sent = await message.reply_photo(*args, **kwargs)
+    remember_message(sent.chat_id, sent.message_id)
+    return sent
+
+
+def is_clean_request(text: str) -> bool:
+    value = re.sub(r"\\s+", " ", (text or "").strip().lower())
+    value = re.sub(r"[.!?,]+", " ", value)
+    value = re.sub(r"\\s+", " ", value).strip()
+
+    exact_phrases = {
+        "clean",
+        "clean chat",
+        "clear chat",
+        "chat clean",
+        "chat clear",
+        "clean kardo chat",
+        "clear kardo chat",
+        "chat clean kardo",
+        "chat clear kardo",
+        "chat saaf kardo",
+        "chat saaf karo",
+        "purani chat delete karo",
+        "purani chat delete kardo",
+        "purani conversation delete karo",
+        "conversation clear karo",
+        "conversation clear kardo",
+        "conversation reset karo",
+        "fresh start karo",
+        "nayi chat shuru karo",
+        "nayi conversation shuru karo",
+        "sab messages delete karo",
+        "saare messages delete karo",
+        "chat ko clean karo",
+        "chat ko clean kardo",
+        "chat ko clear karo",
+        "chat ko clear kardo",
+    }
+
+    if value in exact_phrases:
+        return True
+
+    # Natural variants such as "meri purani chat clean kar do".
+    has_chat = any(word in value for word in ("chat", "conversation"))
+    has_clean = any(
+        phrase in value
+        for phrase in (
+            "clean",
+            "clear",
+            "saaf",
+            "delete",
+            "reset",
+            "fresh start",
+            "nayi chat",
+            "nayi conversation",
+        )
+    )
+    has_action = any(
+        word in value
+        for word in ("karo", "kardo", "kar do", "kar dijiye", "do", "please")
+    )
+    return has_chat and has_clean and (has_action or "delete" in value)
+
+
+async def clean_chat(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    current_message_id: int | None = None,
+    chat_type: str | None = None,
+) -> int:
+    cutoff = int(time.time()) - MESSAGE_RETENTION_SECONDS
+
+    with sqlite3.connect(MESSAGE_DB) as conn:
+        rows = conn.execute(
+            """
+            SELECT message_id
+            FROM message_history
+            WHERE chat_id = ? AND created_at >= ?
+            ORDER BY message_id
+            """,
+            (chat_id, cutoff),
+        ).fetchall()
+
+    message_ids = {row[0] for row in rows}
+
+    # In a private chat Telegram allows bots to delete incoming user
+    # messages as well as their own messages. Use the current message-id
+    # sequence to also catch recent messages from before this tracker
+    # was installed. Telegram skips message IDs that do not exist and
+    # refuses messages older than 48 hours.
+    if chat_type == "private" and current_message_id:
+        scan_start = max(
+            1,
+            current_message_id - CLEAN_PRIVATE_CHAT_SCAN_LIMIT + 1,
+        )
+        message_ids.update(
+            range(scan_start, current_message_id + 1)
+        )
+
+    ordered_ids = sorted(message_ids)
+
+    deleted = 0
+    for start in range(0, len(ordered_ids), 100):
+        chunk = ordered_ids[start:start + 100]
+        if not chunk:
+            continue
+
+        try:
+            await context.bot.delete_messages(
+                chat_id=chat_id,
+                message_ids=chunk,
+            )
+            deleted += len(chunk)
+        except Exception:
+            # If a mixed batch contains an undeletable/expired message,
+            # fall back to deleting one-by-one so valid messages still go.
+            for message_id in chunk:
+                try:
+                    await context.bot.delete_message(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                    )
+                    deleted += 1
+                except Exception:
+                    pass
+
+    with sqlite3.connect(MESSAGE_DB) as conn:
+        conn.execute(
+            "DELETE FROM message_history WHERE chat_id = ?",
+            (chat_id,),
+        )
+        conn.commit()
+
+    conversation_memory.pop(chat_id, None)
+    return deleted
 
 
 # =========================================================
@@ -776,51 +997,34 @@ User message:
 # =========================================================
 
 async def generate_image(prompt: str):
-    """Generate an image with Nano Banana 2 Lite.
+    """Generate an image using Gemini's current image-generation models."""
 
-    Uses the Gemini Interactions API image response format.
-    This avoids passing response_format into GenerateContentConfig,
-    which caused the previous validation error.
-    """
     prompt = prompt.strip()
 
     if not prompt:
-        raise ValueError(
-            "Image prompt is empty."
-        )
-
-    def call_image_api():
-        return client.interactions.create(
-            model=IMAGE_MODEL,
-            input=prompt,
-            response_format={
-                "type": "image",
-                "mime_type": "image/jpeg",
-                "aspect_ratio": IMAGE_ASPECT_RATIO,
-                "image_size": "1K",
-            },
-        )
+        raise ValueError("Image prompt is empty.")
 
     last_error = None
 
-    for attempt in range(2):
+    for model in IMAGE_FALLBACK_MODELS:
         try:
-            response = await asyncio.to_thread(
-                call_image_api
-            )
+            def call_image_api(model_name=model):
+                return client.interactions.create(
+                    model=model_name,
+                    input=prompt,
+                    response_format={
+                        "type": "image",
+                        "aspect_ratio": IMAGE_ASPECT_RATIO,
+                        "image_size": IMAGE_SIZE,
+                    },
+                )
 
-            output_image = getattr(
-                response,
-                "output_image",
-                None,
-            )
+            response = await asyncio.to_thread(call_image_api)
+
+            output_image = getattr(response, "output_image", None)
 
             if output_image is not None:
-                data = getattr(
-                    output_image,
-                    "data",
-                    None,
-                )
+                data = getattr(output_image, "data", None)
 
                 if data:
                     if isinstance(data, str):
@@ -836,22 +1040,19 @@ async def generate_image(prompt: str):
                     return bytes(data)
 
             raise RuntimeError(
-                "Image model returned no image data."
+                f"Image model {model} returned no image data."
             )
 
         except Exception as exc:
             last_error = exc
             logger.exception(
-                "Image generation attempt %s failed: %s",
-                attempt + 1,
+                "Image generation failed with model %s: %s",
+                model,
                 exc,
             )
 
-            if attempt == 0:
-                await asyncio.sleep(0.7)
-
     raise RuntimeError(
-        f"Image generation failed: {last_error}"
+        f"All image models failed: {last_error}"
     )
 
 
@@ -863,172 +1064,82 @@ async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+    await track_incoming_message(update.message)
 
     user = update.effective_user
-
     name = get_display_name(user)
 
-    keyboard = [
-
-        [
-            InlineKeyboardButton(
-                "💬 Start Chat",
-                callback_data="chat",
-            ),
-            InlineKeyboardButton(
-                "🎨 Create Image",
-                callback_data="image",
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🧠 New Conversation",
-                callback_data="clear",
-            ),
-            InlineKeyboardButton(
-                "ℹ️ Help",
-                callback_data="help",
-            ),
-        ],
-    ]
-
     message = f"""
-✨ <b>Welcome to KIVA AI</b>, {name}
+✨ <b>Welcome to KIVA AI</b>
+
+{name}, good to see you.
 
 ━━━━━━━━━━━━━━━━━━
 
-Your premium AI assistant is ready.
+<b>KIVA AI is ready.</b>
 
-🧠 Intelligent conversations
-⚡ Fast responses
-🌐 Live information
-💻 Coding & problem solving
-🖼️ Image understanding
-🎨 Image creation
-📄 Document & PDF analysis
-🎙️ Audio understanding
-🌍 Hindi • Hinglish • English
-
-━━━━━━━━━━━━━━━━━━
-
-<b>KIVA AI is ready whenever you are.</b>
-
-Just type your message and let's get started. 🚀
+Bas jo chahiye, seedha message mein batao.
 """
 
-    await update.message.reply_text(
+    await tracked_reply_text(
+        update.message,
         message,
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(
-            keyboard
-        ),
     )
 
 
 # =========================================================
-# /HELP
+# OWNER
 # =========================================================
 
-async def help_command(
+async def owner_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+    await track_incoming_message(update.message)
 
-    text = """
-✨ <b>KIVA AI — Help</b>
-
-<b>💬 Chat</b>
-Simply type anything and KIVA AI will respond.
-
-<b>🎨 Image Creation</b>
-Use:
-
-<code>/image a cinematic futuristic city at night</code>
-
-Ya normal language mein bolo:
-
-<i>Ek futuristic city ki image banao.</i>
-
-<b>Commands</b>
-
-/start — Open KIVA AI
-/help — Help
-/image — Generate an image
-/clear — Start fresh
-/status — Bot status
-
-<b>🌍 Languages</b>
-Hindi • Hinglish • English
-
-<b>✨ Tip</b>
-Aap naturally baat kar sakte ho.
-KIVA AI automatically request samajhne ki koshish karega.
-"""
-
-    await update.message.reply_text(
-        text,
-        parse_mode="HTML",
-    )
-
-
-# =========================================================
-# /CLEAR
-# =========================================================
-
-async def clear_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    user_id = update.effective_user.id
-
-    conversation_memory.pop(
-        user_id,
-        None
-    )
-
-    await update.message.reply_text(
-        "🧠 <b>Fresh conversation ready.</b>\n\n"
-        "Purani conversation context clear kar di gayi hai.\n"
-        "Ab hum fresh start kar sakte hain. ✨",
-        parse_mode="HTML",
-    )
-
-
-# =========================================================
-# /STATUS
-# =========================================================
-
-async def status_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    # IMPORTANT:
-    # Never expose actual Gemini/provider/model IDs.
-
-    text = """
-🟢 <b>KIVA AI is operational</b>
+    text = f"""
+💳 <b>KIVA AI</b>
 
 ━━━━━━━━━━━━━━━━━━
 
-⚡ Engine: <code>Kiva AI-3.6-flash</code>
-🎨 Image: <code>Kiva AI-3.1-flash-image</code>
-🧠 Memory: Active
-🌐 Web Search: Available
-💻 Code Execution: Available
-🖼️ Vision: Available
-📄 Documents: Available
+👤 <b>OWNER</b>
+<b>{OWNER_NAME}</b>
+
+✈️ Telegram
+<a href="{OWNER_URL}">@{OWNER_USERNAME}</a>
 
 ━━━━━━━━━━━━━━━━━━
 
-<b>Everything is ready.</b> 🚀
+⚡ <b>Engine</b>
+<code>{PUBLIC_TEXT_ENGINE}</code>
+
+🎨 <b>Image Engine</b>
+<code>{PUBLIC_IMAGE_ENGINE}</code>
+
+🧠 <b>Memory</b>
+Active
+
+━━━━━━━━━━━━━━━━━━
+
+<b>Built & maintained by {OWNER_NAME}.</b>
 """
 
-    await update.message.reply_text(
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "✈️ Contact Owner",
+                url=OWNER_URL,
+            )
+        ]
+    ])
+
+    await tracked_reply_text(
+        update.message,
         text,
         parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=keyboard,
     )
 
 
@@ -1040,6 +1151,7 @@ async def image_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+    await track_incoming_message(update.message)
 
     prompt = " ".join(
         context.args
@@ -1047,7 +1159,7 @@ async def image_command(
 
     if not prompt:
 
-        await update.message.reply_text(
+        await tracked_reply_text(update.message,
             "🎨 <b>Image Generator</b>\n\n"
             "Example:\n"
             "<code>/image a cinematic futuristic city at night</code>",
@@ -1068,7 +1180,7 @@ async def image_command(
 
     try:
 
-        await update.message.reply_text(
+        await tracked_reply_text(update.message,
             "🎨 <b>Creating your image…</b>\n\n"
             "Turning your prompt into a visual. ✨",
             parse_mode="HTML",
@@ -1078,7 +1190,7 @@ async def image_command(
             prompt
         )
 
-        await update.message.reply_photo(
+        await tracked_reply_photo(update.message,
             photo=io.BytesIO(
                 image_bytes
             ),
@@ -1091,7 +1203,7 @@ async def image_command(
             "Image generation failed"
         )
 
-        await update.message.reply_text(
+        await tracked_reply_text(update.message,
             "⚠️ <b>Image generation failed.</b>\n\n"
             "Please try again in a few seconds.",
             parse_mode="HTML",
@@ -1130,6 +1242,21 @@ async def text_message(
     if not prompt:
         return
 
+    await track_incoming_message(update.message)
+
+    # -----------------------------------------------------
+    # NATURAL CHAT CLEANUP
+    # -----------------------------------------------------
+
+    if is_clean_request(prompt):
+        await clean_chat(
+            context,
+            chat_id,
+            current_message_id=update.message.message_id,
+            chat_type=update.effective_chat.type,
+        )
+        return
+
     # -----------------------------------------------------
     # IMAGE REQUEST
     # -----------------------------------------------------
@@ -1142,7 +1269,7 @@ async def text_message(
 
         if not image_prompt:
 
-            await update.message.reply_text(
+            await tracked_reply_text(update.message,
                 "🎨 Bataiye image mein kya create karna hai?"
             )
 
@@ -1160,7 +1287,7 @@ async def text_message(
 
         try:
 
-            await update.message.reply_text(
+            await tracked_reply_text(update.message,
                 "🎨 <b>Creating your image…</b>\n\n"
                 "Aapke prompt ko visual mein convert kar raha hoon. ✨",
                 parse_mode="HTML",
@@ -1170,7 +1297,7 @@ async def text_message(
                 image_prompt
             )
 
-            await update.message.reply_photo(
+            await tracked_reply_photo(update.message,
                 photo=io.BytesIO(
                     image_bytes
                 ),
@@ -1183,7 +1310,7 @@ async def text_message(
                 "Image request failed"
             )
 
-            await update.message.reply_text(
+            await tracked_reply_text(update.message,
                 "⚠️ <b>Image generation temporarily unavailable.</b>\n\n"
                 "Please try again.",
                 parse_mode="HTML",
@@ -1241,7 +1368,7 @@ async def text_message(
 
                 try:
 
-                    await update.message.reply_text(
+                    await tracked_reply_text(update.message,
                         chunk,
                         parse_mode="HTML",
                     )
@@ -1249,7 +1376,7 @@ async def text_message(
                 except Exception:
 
                     # Safe fallback
-                    await update.message.reply_text(
+                    await tracked_reply_text(update.message,
                         re.sub(
                             r"<[^>]+>",
                             "",
@@ -1264,7 +1391,7 @@ async def text_message(
                 exc,
             )
 
-            await update.message.reply_text(
+            await tracked_reply_text(update.message,
                 "⚠️ <b>KIVA AI temporarily unavailable.</b>\n\n"
                 "Please try again in a few seconds.",
                 parse_mode="HTML",
@@ -1291,6 +1418,8 @@ async def photo_message(
     user_id = user.id
 
     chat_id = update.effective_chat.id
+
+    await track_incoming_message(update.message)
 
     caption = (
         update.message.caption
@@ -1347,14 +1476,14 @@ async def photo_message(
 
             try:
 
-                await update.message.reply_text(
+                await tracked_reply_text(update.message,
                     chunk,
                     parse_mode="HTML",
                 )
 
             except Exception:
 
-                await update.message.reply_text(
+                await tracked_reply_text(update.message,
                     re.sub(
                         r"<[^>]+>",
                         "",
@@ -1368,7 +1497,7 @@ async def photo_message(
             "Image understanding failed"
         )
 
-        await update.message.reply_text(
+        await tracked_reply_text(update.message,
             "⚠️ I couldn't analyze that image right now.\n"
             "Please try again."
         )
@@ -1398,7 +1527,7 @@ async def document_message(
 
     if mime_type != "application/pdf":
 
-        await update.message.reply_text(
+        await tracked_reply_text(update.message,
             "📄 Abhi document understanding ke liye PDF support enabled hai.\n\n"
             "Please PDF upload karke uske saath apna question bhejiye."
         )
@@ -1410,7 +1539,7 @@ async def document_message(
         and document.file_size > 50 * 1024 * 1024
     ):
 
-        await update.message.reply_text(
+        await tracked_reply_text(update.message,
             "⚠️ Ye PDF 50 MB se badi hai.\n"
             "Please smaller PDF upload karein."
         )
@@ -1422,6 +1551,8 @@ async def document_message(
     user_id = user.id
 
     chat_id = update.effective_chat.id
+
+    await track_incoming_message(update.message)
 
     question = (
         update.message.caption
@@ -1476,14 +1607,14 @@ async def document_message(
 
             try:
 
-                await update.message.reply_text(
+                await tracked_reply_text(update.message,
                     chunk,
                     parse_mode="HTML",
                 )
 
             except Exception:
 
-                await update.message.reply_text(
+                await tracked_reply_text(update.message,
                     re.sub(
                         r"<[^>]+>",
                         "",
@@ -1497,7 +1628,7 @@ async def document_message(
             "PDF processing failed"
         )
 
-        await update.message.reply_text(
+        await tracked_reply_text(update.message,
             "⚠️ PDF process nahi ho paayi.\n"
             "Please try again with a smaller PDF."
         )
@@ -1528,6 +1659,8 @@ async def voice_message(
     user_id = user.id
 
     chat_id = update.effective_chat.id
+
+    await track_incoming_message(update.message)
 
     stop_event = asyncio.Event()
 
@@ -1580,14 +1713,14 @@ async def voice_message(
 
             try:
 
-                await update.message.reply_text(
+                await tracked_reply_text(update.message,
                     chunk,
                     parse_mode="HTML",
                 )
 
             except Exception:
 
-                await update.message.reply_text(
+                await tracked_reply_text(update.message,
                     re.sub(
                         r"<[^>]+>",
                         "",
@@ -1601,7 +1734,7 @@ async def voice_message(
             "Audio processing failed"
         )
 
-        await update.message.reply_text(
+        await tracked_reply_text(update.message,
             "⚠️ Voice message process nahi ho paaya.\n"
             "Please try again."
         )
@@ -1611,67 +1744,6 @@ async def voice_message(
         stop_event.set()
 
         typing_task.cancel()
-
-
-# =========================================================
-# BUTTON HANDLER
-# =========================================================
-
-async def button_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    user_id = query.from_user.id
-
-    if query.data == "clear":
-
-        conversation_memory.pop(
-            user_id,
-            None
-        )
-
-        await query.message.reply_text(
-            "🧠 <b>Fresh conversation started.</b>\n\n"
-            "Ab KIVA AI bilkul fresh context ke saath ready hai. ✨",
-            parse_mode="HTML",
-        )
-
-    elif query.data == "image":
-
-        await query.message.reply_text(
-            "🎨 <b>Image Generator</b>\n\n"
-            "Simply type:\n\n"
-            "<code>/image a futuristic city at night</code>\n\n"
-            "Ya normal language mein bolo:\n"
-            "<i>Ek futuristic city ki image banao.</i>",
-            parse_mode="HTML",
-        )
-
-    elif query.data == "help":
-
-        await query.message.reply_text(
-            "✨ <b>KIVA AI</b>\n\n"
-            "Bas message type karo — KIVA AI automatically "
-            "samajhne ki koshish karega ki aapko kya chahiye.\n\n"
-            "🎨 Image: /image\n"
-            "🧠 New chat: /clear\n"
-            "📊 Status: /status\n"
-            "ℹ️ Help: /help",
-            parse_mode="HTML",
-        )
-
-    elif query.data == "chat":
-
-        await query.message.reply_text(
-            "💬 <b>Chat mode activated.</b>\n\n"
-            "Bas apna message bhejiye. 🚀",
-            parse_mode="HTML",
-        )
 
 
 # =========================================================
@@ -1697,50 +1769,23 @@ async def error_handler(
 async def post_init(
     application: Application
 ):
-
     await application.bot.set_my_commands([
-
-        (
-            "start",
-            "Open KIVA AI"
-        ),
-
-        (
-            "help",
-            "How to use KIVA AI"
-        ),
-
-        (
-            "image",
-            "Generate an AI image"
-        ),
-
-        (
-            "clear",
-            "Start a new conversation"
-        ),
-
-        (
-            "status",
-            "Show bot status"
-        ),
-
+        ("start", "Open KIVA AI"),
+        ("image", "Generate an AI image"),
+        ("owner", "KIVA AI owner"),
     ])
 
     try:
-
         await application.bot.set_my_short_description(
             "KIVA AI — your premium intelligent AI assistant."
         )
 
         await application.bot.set_my_description(
-            "KIVA AI is a premium AI assistant for chat, "
-            "coding, analysis, image creation, documents "
-            "and more."
+            "KIVA AI is a premium AI assistant for natural chat, "
+            "coding, analysis, image creation, documents and more."
         )
 
     except Exception:
-
         logger.exception(
             "Could not update bot profile"
         )
@@ -1798,13 +1843,6 @@ def main():
 
     application.add_handler(
         CommandHandler(
-            "help",
-            help_command
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
             "image",
             image_command
         )
@@ -1812,25 +1850,8 @@ def main():
 
     application.add_handler(
         CommandHandler(
-            "clear",
-            clear_command
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "status",
-            status_command
-        )
-    )
-
-    # -----------------------------------------------------
-    # Buttons
-    # -----------------------------------------------------
-
-    application.add_handler(
-        CallbackQueryHandler(
-            button_handler
+            "owner",
+            owner_command
         )
     )
 
@@ -1902,3 +1923,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
