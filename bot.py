@@ -17,7 +17,7 @@ TOKEN = os.environ.get("API_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 BOT_NAME = "KIVA AI"
-BOT_VERSION = "3.9 STABLE ENGINE"
+BOT_VERSION = "4.0 ULTIMATE STABLE"
 
 DB_FILE = "kiva_ai.db"
 
@@ -33,8 +33,8 @@ if not GEMINI_API_KEY:
 bot = telebot.TeleBot(TOKEN, parse_mode=None)
 genai.configure(api_key=GEMINI_API_KEY)
 
-# Using the universally supported stable model name
-ai_model = genai.GenerativeModel("gemini-pro")
+# Using the correct modern model name for Google AI keys
+ai_model = genai.GenerativeModel("gemini-1.5-flash")
 
 RENDER_EXTERNAL_URL = "https://kiva-ai.onrender.com/"
 webhook_url = f"{RENDER_EXTERNAL_URL}{TOKEN}"
