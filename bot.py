@@ -17,7 +17,7 @@ TOKEN = os.environ.get("API_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 BOT_NAME = "KIVA AI"
-BOT_VERSION = "3.8 WEBHOOK DEBUGGER"
+BOT_VERSION = "3.9 STABLE ENGINE"
 
 DB_FILE = "kiva_ai.db"
 
@@ -33,7 +33,8 @@ if not GEMINI_API_KEY:
 bot = telebot.TeleBot(TOKEN, parse_mode=None)
 genai.configure(api_key=GEMINI_API_KEY)
 
-ai_model = genai.GenerativeModel("gemini-1.5-flash")
+# Using the universally supported stable model name
+ai_model = genai.GenerativeModel("gemini-pro")
 
 RENDER_EXTERNAL_URL = "https://kiva-ai.onrender.com/"
 webhook_url = f"{RENDER_EXTERNAL_URL}{TOKEN}"
@@ -135,7 +136,6 @@ def handle_ai_messages(message):
         response = ai_model.generate_content(full_prompt)
         ai_reply = response.text if response and response.text else "I am processing your request. Could you please rephrase?"
     except Exception as err:
-        # Printing full detailed traceback in Render logs so we see the exact root cause
         print("----------------- GEMINI ERROR START -----------------")
         traceback.print_exc()
         print(f"Error Message: {err}")
