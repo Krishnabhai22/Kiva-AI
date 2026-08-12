@@ -13,14 +13,14 @@ from flask import Flask
 import google.generativeai as genai
 
 # ============================================================
-# KIVA AI • TELEGRAM INTELLIGENCE BOT
+# KIVA AI • ADVANCED ENTERPRISE INTELLIGENCE BOT
 # ============================================================
 
 TOKEN = os.environ.get("API_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 BOT_NAME = "KIVA AI"
-BOT_VERSION = "2.0 ULTRA SECURE"
+BOT_VERSION = "3.0 ULTRA PROFESSIONAL"
 
 OWNER_IDS = {
     1332494807
@@ -44,7 +44,31 @@ if not GEMINI_API_KEY:
 
 bot = telebot.TeleBot(TOKEN, parse_mode=None)
 genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel("gemini-pro")
+
+# System instruction to make it behave like a professional standalone AI (Kiva AI)
+SYSTEM_INSTRUCTION = (
+    "You are Kiva AI, an advanced, highly intelligent, and professional AI assistant "
+    "created by Krishna. You provide clean, detailed, and accurate answers. "
+    "You seamlessly detect and match the user's language—whether it is Hinglish, Hindi, "
+    "English, or any other global language—and reply in the exact same language and tone. "
+    "Never mention Google or Gemini; you are entirely Kiva AI."
+)
+
+generation_config = {
+    "temperature": 0.7,
+    "top_p": 0.95,
+    "top_k": 40,
+    "max_output_tokens": 8192,
+}
+
+ai_model = genai.GenerativeModel(
+    model_name="gemini-1.5-flash",
+    generation_config=generation_config,
+    system_instruction=SYSTEM_INSTRUCTION
+)
+
+# Store chat sessions per user for conversational memory
+user_sessions = {}
 
 # ============================================================
 # FLASK KEEP-ALIVE SERVER (FOR RENDER FREE WEB SERVICE)
@@ -52,7 +76,7 @@ gemini_model = genai.GenerativeModel("gemini-pro")
 
 @app.route("/")
 def home():
-    return "KIVA-AI BOT ENGINE • ONLINE"
+    return "KIVA-AI ADVANCED ENGINE • ONLINE"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -72,20 +96,21 @@ def init_database():
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS bot_users (
                 user_id INTEGER PRIMARY KEY,
-                first_name TEXT
+                first_name TEXT,
+                username TEXT
             )
         """)
         connection.commit()
         connection.close()
 
-def register_user(user_id, first_name):
+def register_user(user_id, first_name, username):
     with db_lock:
         connection = get_connection()
         cursor = connection.cursor()
         cursor.execute("""
-            INSERT OR REPLACE INTO bot_users (user_id, first_name)
-            VALUES (?, ?)
-        """, (user_id, first_name))
+            INSERT OR REPLACE INTO bot_users (user_id, first_name, username)
+            VALUES (?, ?, ?)
+        """, (user_id, first_name, username))
         connection.commit()
         connection.close()
 
@@ -104,49 +129,71 @@ def get_total_users():
 
 @bot.message_handler(commands=["start", "help"])
 def start_command(message):
-    if message.from_user:
-        register_user(message.from_user.id, message.from_user.first_name)
+    user = message.from_user
+    if not user:
+        return
+        
+    register_user(user.id, user.first_name, user.username)
     
+    name = html.escape(user.first_name or "User")
     welcome_text = (
-        f"<b>🤖 {BOT_NAME} • COMMAND CENTER</b>\n"
+        f"<b>✨ Hii {name}! Welcome to {BOT_NAME}</b>\n"
         "────────────────────────\n"
-        "Welcome! I am your advanced AI assistant powered by Gemini.\n\n"
-        "● <b>Status:</b> ONLINE\n"
-        f"● <b>Version:</b> {BOT_VERSION}\n\n"
-        "<i>Send me any question or prompt, and I will generate a response for you!</i>"
+        "I am your advanced, high-performance professional AI assistant. "
+        "You can chat with me about anything, ask questions, write code, solve problems, "
+        "or converse in any language (Hinglish, Hindi, English, etc.)!\n\n"
+        "● <b>Status:</b> ONLINE & ACTIVE\n"
+        f"● <b>Engine:</b> {BOT_VERSION}\n\n"
+        "<i>What would you like to discuss today? Just type your prompt below!</i>"
     )
     bot.send_message(message.chat.id, welcome_text, parse_mode="HTML")
 
 @bot.message_handler(func=lambda message: message.from_user and not message.from_user.is_bot, content_types=["text"])
 def handle_ai_messages(message):
+    user = message.from_user
+    user_id = user.id
     user_prompt = message.text.strip()
+    
     if not user_prompt:
         return
 
-    # Typing action show karein
+    register_user(user_id, user.first_name, user.username)
+
     try:
         bot.send_chat_action(message.chat.id, 'typing')
     except Exception:
         pass
 
     try:
-        response = gemini_model.generate_content(user_prompt)
-        ai_reply = response.text if response and response.text else "Sorry, I couldn't generate a response."
+        # Maintain separate conversational chat history for each user (ChatGPT style memory)
+        if user_id not in user_sessions:
+            user_sessions[user_id] = ai_model.start_chat(history=[])
+        
+        chat_session = user_sessions[user_id]
+        response = chat_session.send_message(user_prompt)
+        ai_reply = response.text if response and response.text else "I am processing your request. Could you please rephrase?"
     except Exception as e:
-        ai_reply = f"An error occurred while communicating with AI: {e}"
+        # If chat session errors out, reset session and try a direct generation fallback
+        try:
+            if user_id in user_sessions:
+                del user_sessions[user_id]
+            fallback_response = ai_model.generate_content(user_prompt)
+            ai_reply = fallback_response.text if fallback_response and fallback_response.text else "An error occurred."
+        except Exception as err:
+            ai_reply = f"System Error: Unable to process response right now. Please try again later."
 
-    # Telegram message limit handle karne ke liye (max 4096 chars)
+    # Handle Telegram max message length limit (4096 characters)
     if len(ai_reply) > 4000:
-        ai_reply = ai_reply[:4000] + "\n\n<i>[Response truncated due to length]</i>"
+        ai_reply = ai_reply[:4000] + "\n\n<i>[Response truncated due to length limits]</i>"
 
     try:
         bot.reply_to(message, ai_reply, parse_mode="Markdown")
     except Exception:
-        # Fallback agar markdown fail ho jaye
+        # Fallback without markdown formatting if symbols clash
         try:
             bot.reply_to(message, ai_reply)
-        except Exception as err:
-            print(f"Failed to send reply: {err}")
+        except Exception as final_err:
+            print(f"Failed to send reply: {final_err}")
 
 # ============================================================
 # BOT BOOTSTRAP
@@ -154,12 +201,11 @@ def handle_ai_messages(message):
 
 if __name__ == "__main__":
     print("========================================")
-    print("        KIVA-AI INTELLIGENCE BOT")
+    print("      KIVA-AI PROFESSIONAL ENGINE")
     print("========================================")
 
     init_database()
 
-    # Flask server ko background thread me chalana (Render Free Tier ke liye zaroori hai)[span_3](start_span)[span_3](end_span)
     threading.Thread(target=run_flask, daemon=True).start()
 
     print("KIVA-AI ENGINE is ONLINE.")
