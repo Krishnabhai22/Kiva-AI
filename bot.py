@@ -10,14 +10,14 @@ from flask import Flask, request
 import google.generativeai as genai
 
 # ============================================================
-# KIVA AI • BULLETPROOF STABLE ENGINE
+# KIVA AI • 100% BULLETPROOF STABLE ENGINE
 # ============================================================
 
 TOKEN = os.environ.get("API_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 BOT_NAME = "KIVA AI"
-BOT_VERSION = "6.0 BULLETPROOF"
+BOT_VERSION = "7.0 FINAL STABLE"
 
 DB_FILE = "kiva_ai.db"
 
@@ -33,14 +33,8 @@ if not GEMINI_API_KEY:
 bot = telebot.TeleBot(TOKEN, parse_mode=None)
 genai.configure(api_key=GEMINI_API_KEY)
 
-# Guaranteed stable model initialization for version 0.3.2
-def get_safe_model():
-    try:
-        return genai.GenerativeModel("gemini-pro")
-    except Exception:
-        return genai.GenerativeModel("models/gemini-pro")
-
-ai_model = get_safe_model()
+# Direct foolproof model initialization for version 0.3.2
+ai_model = genai.GenerativeModel("gemini-pro")
 
 RENDER_EXTERNAL_URL = "https://kiva-ai.onrender.com/"
 webhook_url = f"{RENDER_EXTERNAL_URL}{TOKEN}"
