@@ -32,14 +32,11 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("API_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 PORT = int(os.getenv("PORT", "10000"))
-TELEGRAM_TIMEOUT = 60
-TELEGRAM_RETRIES = 3
 
 # Current Gemini models supported by the Interactions API.
 PRIMARY_MODEL = "gemini-3.5-flash-lite"
 FALLBACK_MODEL = "gemini-2.5-flash-lite"
 MODEL_CANDIDATES = [PRIMARY_MODEL, FALLBACK_MODEL]
-# Google Search grounding on the free tier is routed to 2.5 Flash-Lite.
 WEB_MODEL_CANDIDATES = [FALLBACK_MODEL]
 
 OWNER_NAME = os.getenv("OWNER_NAME", "Krishna Singh")
@@ -299,6 +296,15 @@ def looks_like_astrology(text):
 # SEARCH CITATION EXTRACTION
 # =========================================================
 
+def has_google_search_evidence(interaction):
+    """Check whether the Interactions API actually executed Google Search."""
+    for step in getattr(interaction, "steps", []) or []:
+        step_type = getattr(step, "type", None)
+        if step_type in ("google_search_call", "google_search_result"):
+            return True
+    return False
+
+
 def extract_citations(interaction):
     citations = []
     seen = set()
@@ -399,11 +405,6 @@ async def generate_text(user_id, prompt, display_name):
         )
 
     last_error = None
-
-    # Keep ordinary chats on 3.5 Flash-Lite, but route verified/current
-    # questions to 2.5 Flash-Lite because Google Search grounding is
-    # available on its free tier. This avoids wasting a failed attempt
-    # on 3.5 Flash-Lite for a tool that is not free-tier available.
     models_to_try = WEB_MODEL_CANDIDATES if web_required else MODEL_CANDIDATES
 
     for model in models_to_try:
@@ -421,11 +422,12 @@ async def generate_text(user_id, prompt, display_name):
             )
             citations = extract_citations(interaction)
 
-            # Current/verification-sensitive questions must have actual search
-            # evidence. Never silently fall back to an unverified answer.
-            if web_required and not citations:
+            # Require actual Google Search execution, not merely URL annotations.
+            # The Interactions API can return search-result steps even when the
+            # installed SDK does not expose URL annotations in the same shape.
+            if web_required and not has_google_search_evidence(interaction):
                 raise RuntimeError(
-                    "Web verification was required but no search citations were returned."
+                    "Google Search did not return a search result for this request."
                 )
 
             conversation_memory[user_id] = interaction.id
@@ -454,7 +456,9 @@ async def generate_text(user_id, prompt, display_name):
                     )
                     answer = getattr(interaction, "output_text", None)
                     citations = extract_citations(interaction)
-                    if answer and (not web_required or citations):
+                    if answer and (
+                        not web_required or has_google_search_evidence(interaction)
+                    ):
                         conversation_memory[user_id] = interaction.id
                         return answer, citations
                 except Exception as retry_exc:
@@ -681,20 +685,17 @@ async def owner_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================================================
 
 async def send_thinking_message(update):
-    """Show a temporary visual processing message; never expose private reasoning."""
     return await update.message.reply_text(
         "Thinking Process\n─────────────────"
     )
 
 
 async def delete_thinking_message(thinking_message):
-    """Delete the temporary processing message before sending the final answer."""
     if not thinking_message:
         return
     try:
         await thinking_message.delete()
     except Exception:
-        # UI cleanup failure must never prevent the actual answer.
         pass
 
 
@@ -769,7 +770,6 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await delete_thinking_message(thinking_message)
             thinking_message = None
-
             await send_answer(update, answer, citations)
 
         except Exception:
@@ -802,58 +802,6 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================================================
-# TELEGRAM IMAGE DOWNLOAD WITH RETRY
-# =========================================================
-
-async def download_telegram_file(context, file_id):
-    last_error = None
-
-    for attempt in range(1, TELEGRAM_RETRIES + 1):
-        try:
-            tg_file = await context.bot.get_file(
-                file_id,
-                read_timeout=TELEGRAM_TIMEOUT,
-                write_timeout=TELEGRAM_TIMEOUT,
-                connect_timeout=TELEGRAM_TIMEOUT,
-                pool_timeout=TELEGRAM_TIMEOUT,
-            )
-
-            image_bytes = bytes(
-                await tg_file.download_as_bytearray(
-                    read_timeout=TELEGRAM_TIMEOUT,
-                    write_timeout=TELEGRAM_TIMEOUT,
-                    connect_timeout=TELEGRAM_TIMEOUT,
-                    pool_timeout=TELEGRAM_TIMEOUT,
-                )
-            )
-
-            if image_bytes:
-                logger.info(
-                    "Telegram file downloaded file_id=%s attempt=%s bytes=%s",
-                    file_id,
-                    attempt,
-                    len(image_bytes),
-                )
-                return image_bytes
-
-        except Exception as exc:
-            last_error = exc
-            logger.warning(
-                "Telegram file download failed attempt=%s/%s reason=%s",
-                attempt,
-                TELEGRAM_RETRIES,
-                exc,
-            )
-
-            if attempt < TELEGRAM_RETRIES:
-                await asyncio.sleep(2 ** (attempt - 1))
-
-    raise RuntimeError(
-        f"Telegram image download failed after {TELEGRAM_RETRIES} attempts"
-    ) from last_error
-
-
-# =========================================================
 # IMAGE HANDLER
 # =========================================================
 
@@ -874,18 +822,15 @@ async def image_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         )
 
-        thinking_message = None
         try:
-            thinking_message = await send_thinking_message(update)
-
             image_bytes = None
             mime_type = "image/jpeg"
 
             if update.message.photo:
                 photo = update.message.photo[-1]
-                image_bytes = await download_telegram_file(
-                    context,
-                    photo.file_id,
+                tg_file = await context.bot.get_file(photo.file_id)
+                image_bytes = bytes(
+                    await tg_file.download_as_bytearray()
                 )
                 mime_type = "image/jpeg"
 
@@ -900,9 +845,9 @@ async def image_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                     return
 
-                image_bytes = await download_telegram_file(
-                    context,
-                    document.file_id,
+                tg_file = await context.bot.get_file(document.file_id)
+                image_bytes = bytes(
+                    await tg_file.download_as_bytearray()
                 )
                 mime_type = doc_mime
 
@@ -919,18 +864,13 @@ async def image_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 mime_type,
             )
 
-            await delete_thinking_message(thinking_message)
-            thinking_message = None
-
             await send_answer(update, answer, citations)
 
         except Exception:
-            await delete_thinking_message(thinking_message)
-            thinking_message = None
             logger.exception("Image processing failed")
             await update.message.reply_text(
-                "Image download/analyze karte waqt temporary network problem aa gayi. "
-                "Maine retry bhi kiya tha. Please image dobara bhejkar try karein."
+                "Image analyze karte waqt problem aa gayi. "
+                "Please image dobara bhejkar try karein."
             )
 
         finally:
@@ -1035,10 +975,6 @@ def main():
     application = (
         Application.builder()
         .token(BOT_TOKEN)
-        .connect_timeout(TELEGRAM_TIMEOUT)
-        .read_timeout(TELEGRAM_TIMEOUT)
-        .write_timeout(TELEGRAM_TIMEOUT)
-        .pool_timeout(TELEGRAM_TIMEOUT)
         .post_init(post_init)
         .concurrent_updates(True)
         .build()
@@ -1075,4 +1011,3 @@ def main():
 if __name__ == "__main__":
     main()
 
-    
