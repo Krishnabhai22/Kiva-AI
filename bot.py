@@ -34,8 +34,8 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 PORT = int(os.getenv("PORT", "10000"))
 
 # Current Gemini models supported by the Interactions API.
-PRIMARY_MODEL = "gemini-3.6-flash"
-FALLBACK_MODEL = "gemini-3.5-flash"
+PRIMARY_MODEL = "gemini-3.5-flash-lite"
+FALLBACK_MODEL = "gemini-2.5-flash-lite"
 MODEL_CANDIDATES = [PRIMARY_MODEL, FALLBACK_MODEL]
 
 OWNER_NAME = os.getenv("OWNER_NAME", "Krishna Singh")
@@ -342,6 +342,14 @@ def append_sources(answer, citations):
 # GEMINI GENERATION
 # =========================================================
 
+def is_rate_limit_error(exc):
+    text = str(exc).lower()
+    return any(token in text for token in (
+        "429", "rate limit", "rate_limit", "quota",
+        "resource_exhausted", "too_many_requests", "exceeded your current quota"
+    ))
+
+
 async def create_interaction(model, input_payload, previous_id, web_required):
     kwargs = {
         "model": model,
@@ -401,41 +409,32 @@ async def generate_text(user_id, prompt, display_name):
                 getattr(interaction, "output_text", None)
                 or "I completed the request, but there was no text response."
             )
-
             citations = extract_citations(interaction)
 
-            # If web verification was required, don't silently accept a response
-            # with no search evidence. This prevents the old hallucination fallback.
+            # Current/verification-sensitive questions must have actual search
+            # evidence. Never silently fall back to an unverified answer.
             if web_required and not citations:
                 raise RuntimeError(
-                    "Web verification was required but no search citations "
-                    "were returned by Gemini."
+                    "Web verification was required but no search citations were returned."
                 )
 
             conversation_memory[user_id] = interaction.id
-
             logger.info(
-                "Answered user=%s model=%s tools=%s citations=%s",
-                user_id,
-                model,
-                web_required,
-                len(citations),
+                "Answered user=%s model=%s web=%s citations=%s",
+                user_id, model, web_required, len(citations)
             )
-
             return answer, citations
 
         except Exception as exc:
             last_error = exc
             logger.exception(
-                "Model failed model=%s tools=%s reason=%s",
-                model,
-                web_required,
-                exc,
+                "Model failed model=%s web=%s reason=%s",
+                model, web_required, exc
             )
 
-            # IMPORTANT: never retry a web-required request without search.
-            # That was the cause of the old false answers.
-            if previous_id:
+            # Do not repeat the same request after a 429/quota error.
+            # Move directly to the fallback model instead.
+            if previous_id and not is_rate_limit_error(exc):
                 try:
                     interaction = await create_interaction(
                         model=model,
@@ -443,50 +442,22 @@ async def generate_text(user_id, prompt, display_name):
                         previous_id=None,
                         web_required=web_required,
                     )
-
                     answer = getattr(interaction, "output_text", None)
-
-                    if answer:
-                        citations = extract_citations(interaction)
-
-                        if web_required and not citations:
-                            raise RuntimeError(
-                                "Memory reset succeeded, but web citations "
-                                "were still missing."
-                            )
-
+                    citations = extract_citations(interaction)
+                    if answer and (not web_required or citations):
                         conversation_memory[user_id] = interaction.id
-
-                        logger.info(
-                            "Answered after memory reset user=%s model=%s "
-                            "tools=%s citations=%s",
-                            user_id,
-                            model,
-                            web_required,
-                            len(citations),
-                        )
-
                         return answer, citations
-
                 except Exception as retry_exc:
                     last_error = retry_exc
-                    logger.exception(
-                        "Retry after memory reset failed model=%s tools=%s "
-                        "reason=%s",
-                        model,
-                        web_required,
-                        retry_exc,
-                    )
+                    logger.exception("Memory reset retry failed model=%s", model)
 
     if web_required:
         raise RuntimeError(
-            "Web verification is unavailable right now. "
-            "I will not guess about this current or verification-sensitive "
-            "question."
+            "Web verification is unavailable right now. I will not guess about "
+            "this current or verification-sensitive question."
         ) from last_error
 
     raise RuntimeError(f"All text models failed: {last_error}")
-
 
 async def generate_image_answer(
     user_id,
@@ -999,3 +970,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
