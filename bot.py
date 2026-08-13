@@ -128,11 +128,23 @@ def normalize_bullets(text):
     return text
 
 
+def clean_premium_style(text):
+    """Keep normal chat replies clean and premium-looking."""
+    if not text:
+        return text
+
+    text = re.sub(r"!+", ".", text)
+    text = re.sub(r"[ \t]+\.", ".", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text
+
+
 def format_telegram_html(text):
     if not text:
         return "I couldn't generate a response."
 
-    text = normalize_bullets(text.strip())
+    text = clean_premium_style(text.strip())
+    text = normalize_bullets(text)
 
     # Preserve fenced code blocks before HTML escaping.
     code_blocks = []
@@ -219,6 +231,7 @@ Use short paragraphs.
 For lists, use solid dot bullets "•" rather than "*" or "-".
 Do not use decorative ASCII separators.
 Do not spam emojis.
+Do not use exclamation marks in normal conversational replies. Keep punctuation calm and professional.
 Use headings only when they genuinely improve readability.
 For simple questions, answer simply.
 For complex questions, explain in logical steps.
@@ -387,6 +400,20 @@ async def create_interaction(model, input_payload, previous_id, web_required):
     )
 
 
+def is_historical_fact_question(text):
+    """Allow a non-web fallback for clearly past-event questions if Search quota is exhausted."""
+    t = (text or "").lower()
+    past_markers = (
+        "kab hua", "kab huwa", "kab hua tha", "kab huwa tha",
+        "when did", "when was", "date of", "kis saal", "which year",
+    )
+    freshness_markers = (
+        "latest", "today", "current", "recent", "right now",
+        "abhi", "aaj", "live", "news", "this week", "this month",
+    )
+    return any(x in t for x in past_markers) and not any(x in t for x in freshness_markers)
+
+
 async def generate_text(user_id, prompt, display_name):
     previous_id = conversation_memory.get(user_id)
     web_required = needs_web_search(prompt)
@@ -465,6 +492,39 @@ async def generate_text(user_id, prompt, display_name):
                     last_error = retry_exc
                     logger.exception("Memory reset retry failed model=%s", model)
 
+    # Google Search can return 429 when the project's grounding quota is exhausted.
+    # For clearly historical questions, use the normal model as a fallback instead
+    # of showing a generic failure. The answer is not presented as web-verified.
+    if web_required and is_rate_limit_error(last_error) and is_historical_fact_question(prompt):
+        logger.warning(
+            "Search quota exhausted; using non-web fallback for historical question user=%s",
+            user_id,
+        )
+        for model in MODEL_CANDIDATES:
+            try:
+                interaction = await create_interaction(
+                    model=model,
+                    input_payload=(
+                        context_text
+                        + "\n\nIMPORTANT: Google Search is unavailable for this request. "
+                        "Answer this historical factual question from your reliable model knowledge. "
+                        "Do not claim that you searched the web or that the answer is web-verified."
+                    ),
+                    previous_id=None,
+                    web_required=False,
+                )
+                answer = getattr(interaction, "output_text", None)
+                if answer:
+                    conversation_memory[user_id] = interaction.id
+                    return answer, []
+            except Exception as fallback_exc:
+                last_error = fallback_exc
+                logger.exception(
+                    "Historical non-web fallback failed model=%s reason=%s",
+                    model,
+                    fallback_exc,
+                )
+
     if web_required:
         raise RuntimeError(
             "Web verification is unavailable right now. I will not guess about "
@@ -472,6 +532,7 @@ async def generate_text(user_id, prompt, display_name):
         ) from last_error
 
     raise RuntimeError(f"All text models failed: {last_error}")
+
 
 async def generate_image_answer(
     user_id,
