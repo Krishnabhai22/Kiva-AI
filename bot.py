@@ -357,9 +357,12 @@ async def create_interaction(model, input_payload, previous_id, web_required):
         kwargs["previous_interaction_id"] = previous_id
 
     if web_required:
-        # Search is deliberately mandatory for this request.
+        # Enable Google Search for verification-sensitive/current questions.
+        # Do NOT pass tool_choice as a top-level argument: the installed
+        # google-genai SDK rejects that keyword. The model is instructed to
+        # use the enabled search tool, and generate_text() requires citations
+        # before accepting a web-verified answer.
         kwargs["tools"] = [{"type": "google_search"}]
-        kwargs["tool_choice"] = "any"
 
     return await asyncio.to_thread(
         lambda: client.interactions.create(**kwargs)
@@ -996,4 +999,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
