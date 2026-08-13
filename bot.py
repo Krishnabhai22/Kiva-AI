@@ -39,6 +39,8 @@ TELEGRAM_RETRIES = 3
 PRIMARY_MODEL = "gemini-3.5-flash-lite"
 FALLBACK_MODEL = "gemini-2.5-flash-lite"
 MODEL_CANDIDATES = [PRIMARY_MODEL, FALLBACK_MODEL]
+# Google Search grounding on the free tier is routed to 2.5 Flash-Lite.
+WEB_MODEL_CANDIDATES = [FALLBACK_MODEL]
 
 OWNER_NAME = os.getenv("OWNER_NAME", "Krishna Singh")
 OWNER_USERNAME = os.getenv("OWNER_USERNAME", "qrishna")
@@ -398,7 +400,13 @@ async def generate_text(user_id, prompt, display_name):
 
     last_error = None
 
-    for model in MODEL_CANDIDATES:
+    # Keep ordinary chats on 3.5 Flash-Lite, but route verified/current
+    # questions to 2.5 Flash-Lite because Google Search grounding is
+    # available on its free tier. This avoids wasting a failed attempt
+    # on 3.5 Flash-Lite for a tool that is not free-tier available.
+    models_to_try = WEB_MODEL_CANDIDATES if web_required else MODEL_CANDIDATES
+
+    for model in models_to_try:
         try:
             interaction = await create_interaction(
                 model=model,
@@ -673,20 +681,20 @@ async def owner_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================================================
 
 async def send_thinking_message(update):
-    """Send a temporary visual processing message. No private reasoning is shown."""
+    """Show a temporary visual processing message; never expose private reasoning."""
     return await update.message.reply_text(
         "Thinking Process\n─────────────────"
     )
 
 
 async def delete_thinking_message(thinking_message):
-    """Remove the temporary thinking message immediately before the final answer."""
+    """Delete the temporary processing message before sending the final answer."""
     if not thinking_message:
         return
     try:
         await thinking_message.delete()
     except Exception:
-        # Deletion failure must never break the actual answer.
+        # UI cleanup failure must never prevent the actual answer.
         pass
 
 
@@ -751,7 +759,6 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         thinking_message = None
         try:
-            # Send the visual processing message first, then generate the answer.
             thinking_message = await send_thinking_message(update)
 
             answer, citations = await generate_text(
@@ -760,7 +767,6 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 get_display_name(user),
             )
 
-            # Delete the processing message immediately before the real answer.
             await delete_thinking_message(thinking_message)
             thinking_message = None
 
@@ -870,7 +876,6 @@ async def image_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         thinking_message = None
         try:
-            # Send the visual processing message first, before downloading/analyzing.
             thinking_message = await send_thinking_message(update)
 
             image_bytes = None
@@ -914,7 +919,6 @@ async def image_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 mime_type,
             )
 
-            # Delete the processing message immediately before the real answer.
             await delete_thinking_message(thinking_message)
             thinking_message = None
 
@@ -1071,3 +1075,4 @@ def main():
 if __name__ == "__main__":
     main()
 
+    
