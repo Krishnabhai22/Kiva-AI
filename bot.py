@@ -31,24 +31,12 @@ BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("API_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 PORT = int(os.getenv("PORT", "10000"))
 
-# Free-tier friendly default. You can override this in Render with
-# GEMINI_MODEL, but obsolete 2.5-flash-lite is deliberately rejected.
-REQUESTED_MODEL = (os.getenv("GEMINI_MODEL") or "gemini-3-flash-preview").strip()
-
-OBSOLETE_MODELS = {
-    "gemini-2.5-flash-lite",
-    "gemini-2.0-flash-lite",
-    "gemini-2.0-flash",
-}
-
-if REQUESTED_MODEL in OBSOLETE_MODELS:
-    REQUESTED_MODEL = "gemini-3-flash-preview"
-
-MODEL_CANDIDATES = list(dict.fromkeys([
-    REQUESTED_MODEL,
-    "gemini-3-flash-preview",
-    "gemini-2.5-flash",
-]))
+# Gemini 3.x production models. Do not read GEMINI_MODEL from Render so an
+# old environment variable cannot force an unavailable/deprecated model.
+# Both models currently have free standard-tier text pricing.
+PRIMARY_MODEL = "gemini-3.6-flash"
+FALLBACK_MODEL = "gemini-3.5-flash-lite"
+MODEL_CANDIDATES = [PRIMARY_MODEL, FALLBACK_MODEL]
 
 # Owner information
 OWNER_NAME = os.getenv("OWNER_NAME", "Krishna Singh")
@@ -240,10 +228,10 @@ Distinguish facts from estimates, opinions and predictions.
 For calculations, reason carefully and give the final result clearly.
 
 CURRENT INFORMATION
-When Google Search is available and useful, prefer verified current sources.
-For news, prices, laws, product availability, sports, weather, current
-people/companies, recent events and other changing information, verify first.
-Do not present old knowledge as current.
+For current or changing information, use Google Search when the tool is available.
+On the free Gemini 3.x API tier, Google Search grounding may not be available.
+If search is unavailable, answer from known information but clearly avoid
+claiming that an unverified detail is definitely current.
 
 SAFETY AND LEGALITY
 Be helpful with legitimate questions about science, sex education,
@@ -376,9 +364,9 @@ ask only for the missing details.
                 "model": model,
                 "input": user_context,
                 "system_instruction": SYSTEM_PROMPT,
+                # Gemini 3.6/3.5 no longer need legacy sampling parameters.
                 "generation_config": {
                     "max_output_tokens": 1800,
-                    "temperature": 0.7,
                 },
             }
 
@@ -404,6 +392,33 @@ ask only for the missing details.
         except Exception as exc:
             last_error = exc
             logger.exception("Model failed: %s", model)
+
+            # Google Search grounding is not included in the free tier for
+            # Gemini 3.x. If a current-info request fails because the tool is
+            # unavailable, retry the same model once without tools so the bot
+            # still answers instead of showing a generic outage message.
+            if tools:
+                try:
+                    no_tools_kwargs = dict(kwargs)
+                    no_tools_kwargs.pop("tools", None)
+                    interaction = await asyncio.to_thread(
+                        lambda: client.interactions.create(**no_tools_kwargs)
+                    )
+                    answer = getattr(interaction, "output_text", None)
+                    if answer:
+                        conversation_memory[user_id] = interaction.id
+                        logger.info(
+                            "Answered without optional tools user=%s model=%s",
+                            user_id,
+                            model,
+                        )
+                        return answer
+                except Exception as retry_exc:
+                    last_error = retry_exc
+                    logger.exception(
+                        "Retry without optional tools failed: %s",
+                        model,
+                    )
 
             # If a previous interaction is invalid/corrupted, retry once
             # without conversation state before moving to the next model.
@@ -671,7 +686,7 @@ def health():
     return jsonify({
         "status": "healthy",
         "bot": "Kiva AI",
-        "model": REQUESTED_MODEL,
+        "model": PRIMARY_MODEL,
     })
 
 
@@ -752,4 +767,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
