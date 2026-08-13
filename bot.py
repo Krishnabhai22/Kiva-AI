@@ -62,6 +62,9 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 # Per-user server-side conversation state.
 conversation_memory = {}
 user_locks = {}
+# Last language/style detected from the user. Used by image-only messages
+# when Telegram does not provide a caption.
+user_language_memory = {}
 
 # Central project-level Gemini quota guard.
 # Once Gemini returns a quota/rate-limit error, ALL Gemini routes (text + image)
@@ -107,7 +110,8 @@ SCRIPT_RANGES = (
 )
 
 def detect_language(text, user):
-    text = text or ""
+    """Detect the language/style of the actual message, not Telegram UI language."""
+    text = (text or "").strip()
     counts = {lang: 0 for lang, _, _ in SCRIPT_RANGES}
     for ch in text:
         cp = ord(ch)
@@ -115,27 +119,47 @@ def detect_language(text, user):
             if start <= cp <= end:
                 counts[lang] += 1
                 break
+
     best = max(counts, key=counts.get) if counts else "en"
     if counts.get(best, 0) > 0:
         return best
-    # Roman Hindi / Hinglish is intentionally kept as Hindi-style routing.
-    t = text.lower()
-    hinglish = (" ka ", " hai", " hain", " kya ", " kaise ", " mujhe ",
-                " batao", " nahi", " kyu", " kyun", " kab ", " mein ", " main ")
-    if any(x in f" {t} " for x in hinglish):
+
+    # Roman Hindi / Hinglish detection. Keep this deliberately broad enough
+    # to catch natural chat such as: "modi kab pm bana tha", "mujhe batao",
+    # "ye kya hai", "image ko analyze karo".
+    t = re.sub(r"\s+", " ", text.lower()).strip()
+    hinglish_markers = (
+        r"\bka\b", r"\bke\b", r"\bki\b", r"\bko\b", r"\bse\b",
+        r"\bhai\b", r"\bhain\b", r"\btha\b", r"\bthi\b", r"\bthe\b",
+        r"\bkya\b", r"\bkaise\b", r"\bmujhe\b", r"\bmujhko\b",
+        r"\bbatao\b", r"\bbata\b", r"\bnahi\b", r"\bnahi\b",
+        r"\bkyu\b", r"\bkyun\b", r"\bkab\b", r"\bmein\b",
+        r"\bmain\b", r"\bmera\b", r"\bmeri\b", r"\bapka\b",
+        r"\baapka\b", r"\bkarna\b", r"\bkaro\b", r"\bho\b",
+        r"\bwala\b", r"\bwali\b", r"\bchahiye\b", r"\bacha\b",
+        r"\bkaun\b", r"\bkahan\b", r"\bkahan\b", r"\bkabse\b",
+    )
+    if sum(bool(re.search(pat, t)) for pat in hinglish_markers) >= 1:
         return "hi"
+
     return user_language(user)
 
 
-def language_label(lang):
-    return {
-        "hi":"Hindi / Hinglish", "mr":"Marathi", "bn":"Bengali",
-        "gu":"Gujarati", "ta":"Tamil", "te":"Telugu", "kn":"Kannada",
-        "ml":"Malayalam", "pa":"Punjabi", "ur":"Urdu", "ar":"Arabic",
-        "fr":"French", "de":"German", "es":"Spanish", "pt":"Portuguese",
-        "it":"Italian", "ru":"Russian", "ja":"Japanese", "ko":"Korean",
-        "zh":"Chinese", "en":"English",
-    }.get(lang, "the user's language")
+def remember_user_language(user_id, lang):
+    if lang:
+        user_language_memory[user_id] = lang
+
+
+def conversation_language(text, user):
+    """Use the current message when present, otherwise the user's last style."""
+    if text and text.strip():
+        lang = detect_language(text, user)
+        remember_user_language(user.id, lang)
+        return lang
+    remembered = user_language_memory.get(user.id)
+    if remembered:
+        return remembered
+    return user_language(user)
 
 
 def get_user_lock(user_id):
@@ -453,9 +477,13 @@ def is_simple_request(text):
     t = (text or "").strip()
     words = re.findall(r"\w+", t, flags=re.UNICODE)
     if len(words) <= 14 and not needs_web_search(t) and not looks_like_astrology(t):
-        complex_terms = ("explain in detail", "deeply", "compare", "debug", "architecture",
-                         "step by step", "research", "analyze", "analysis", "why", "how does",
-                         "pros and cons", "advantages and disadvantages", "code")
+        complex_terms = (
+            "explain in detail", "detail me", "deeply", "deep me", "compare",
+            "compare karo", "debug", "architecture", "step by step", "step-by-step",
+            "research", "analyze", "analysis", "analyze karo", "why", "kyu", "kyun",
+            "how does", "kaise kaam", "samjhao", "samjha do", "pros and cons",
+            "advantages and disadvantages", "code", "reason batao",
+        )
         return not any(x in t.lower() for x in complex_terms)
     return False
 
@@ -466,9 +494,11 @@ def should_show_thinking(text):
         return False
     words = re.findall(r"\w+", t, flags=re.UNICODE)
     complex_markers = (
-        "explain in detail", "deep research", "deeply", "compare", "contrast",
-        "step by step", "analyze", "analysis", "debug", "write code", "build",
+        "explain in detail", "detail me", "deep research", "deeply", "deep me",
+        "compare", "contrast", "compare karo", "step by step", "step-by-step",
+        "analyze", "analysis", "analyze karo", "debug", "write code", "build",
         "architecture", "strategy", "plan", "research", "why does", "how does",
+        "kaise kaam", "kyu", "kyun", "samjhao", "samjha do", "reason batao",
         "pros and cons", "advantages and disadvantages", "calculate", "derive",
     )
     return len(words) >= 22 or any(x in t for x in complex_markers)
@@ -561,7 +591,7 @@ async def create_interaction(model, input_payload, previous_id, web_required, th
 
 async def generate_text(user_id, prompt, display_name, user=None):
     global gemini_quota_blocked_until
-    lang = detect_language(prompt, user) if user else "en"
+    lang = conversation_language(prompt, user) if user else "en"
     web_required = needs_web_search(prompt)
 
     # Never spend Gemini quota on greetings / obvious small talk.
@@ -653,7 +683,7 @@ def clean_model_text(text):
 
 async def generate_image_answer(user_id, prompt, display_name, image_bytes, mime_type, user=None):
     global gemini_quota_blocked_until
-    lang = detect_language(prompt, user) if user else "en"
+    lang = conversation_language(prompt, user) if user else "en"
 
     if quota_block_active():
         return await quota_fallback(prompt, display_name, lang, image=True), []
@@ -820,24 +850,118 @@ async def owner_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================================================
-# TEMPORARY PREMIUM THINKING UI
+# ADVANCED TEMPORARY PROCESS UI
 # =========================================================
 
-async def send_thinking_message(update):
-    return await update.message.reply_text("Thinking Process")
+STATUS_FRAMES = ("◌", "◔", "◑", "◕")
+
+STATUS_TEXT = {
+    "thinking": {
+        "en": "Thinking Process",
+        "hi": "Aapke sawaal ko process kiya ja raha hai",
+        "mr": "Tumcha prashna process kela jat aahe",
+        "bn": "Apnar proshno process kora hocche",
+        "gu": "Tamara sawaalne process karvama aavi rahyo chhe",
+        "ta": "Ungal kelvi process seyyappadugiradhu",
+        "te": "Mee prashnanu process chestunnanu",
+        "kn": "Nimma prashneyannu process maaduttiddene",
+        "ml": "Ningalude chodyam process cheyyunnu",
+        "pa": "Tuhade sawaal nu process kita ja reha hai",
+        "ur": "Aap ke sawaal ko process kiya ja raha hai",
+        "ar": "جارٍ معالجة سؤالك",
+        "fr": "Traitement de votre question",
+        "de": "Ihre Frage wird verarbeitet",
+        "es": "Procesando tu pregunta",
+        "pt": "Processando sua pergunta",
+        "it": "Elaborazione della domanda",
+        "ru": "Обрабатываю ваш вопрос",
+        "ja": "質問を処理しています",
+        "ko": "질문을 처리하고 있습니다",
+        "zh": "正在处理你的问题",
+    },
+    "image": {
+        "en": "Analyzing Image",
+        "hi": "Image analyze ho rahi hai",
+        "mr": "Image analyze keli jat aahe",
+        "bn": "Image analyze kora hocche",
+        "gu": "Image analyze thai rahi chhe",
+        "ta": "Image analyze seyyappadugiradhu",
+        "te": "Image analyze chestunnanu",
+        "kn": "Image analyze maaduttiddene",
+        "ml": "Image analyze cheyyunnu",
+        "pa": "Image analyze kiti ja rahi hai",
+        "ur": "Image analyze ki ja rahi hai",
+        "ar": "جارٍ تحليل الصورة",
+        "fr": "Analyse de l’image",
+        "de": "Bild wird analysiert",
+        "es": "Analizando la imagen",
+        "pt": "Analisando a imagem",
+        "it": "Analisi dell’immagine",
+        "ru": "Анализирую изображение",
+        "ja": "画像を解析しています",
+        "ko": "이미지를 분석하고 있습니다",
+        "zh": "正在分析图片",
+    },
+}
 
 
-async def send_analyzing_image_message(update):
-    return await update.message.reply_text("Analyzing Image")
+def status_text(kind, lang):
+    return STATUS_TEXT.get(kind, {}).get(lang, STATUS_TEXT[kind]["en"])
 
 
-async def delete_thinking_message(thinking_message):
-    if not thinking_message:
-        return
+def build_status_ui(kind, lang, frame_index=0):
+    title = html.escape(status_text(kind, lang))
+    spinner = STATUS_FRAMES[frame_index % len(STATUS_FRAMES)]
+    return f"<blockquote>🧠 <b>{title}</b>  <code>{spinner}</code></blockquote>"
+
+
+async def _animate_status(message, kind, lang, stop_event):
+    frame = 0
     try:
-        await thinking_message.delete()
-    except Exception:
+        while not stop_event.is_set():
+            await asyncio.sleep(0.75)
+            if stop_event.is_set():
+                break
+            frame += 1
+            try:
+                await message.edit_text(
+                    build_status_ui(kind, lang, frame),
+                    parse_mode="HTML",
+                )
+            except Exception:
+                # The message may already have been deleted or edited by Telegram.
+                pass
+    except asyncio.CancelledError:
         pass
+
+
+async def send_process_message(update, kind, lang):
+    message = await update.message.reply_text(
+        build_status_ui(kind, lang, 0),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+    stop_event = asyncio.Event()
+    animation_task = asyncio.create_task(
+        _animate_status(message, kind, lang, stop_event)
+    )
+    return message, stop_event, animation_task
+
+
+async def delete_process_message(message, stop_event=None, animation_task=None):
+    if stop_event:
+        stop_event.set()
+    if animation_task:
+        animation_task.cancel()
+        try:
+            await animation_task
+        except asyncio.CancelledError:
+            pass
+    if message:
+        try:
+            await message.delete()
+        except Exception:
+            pass
 
 
 # =========================================================
@@ -891,7 +1015,6 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     async with lock:
         stop_event = asyncio.Event()
-        analyzing_message = None
         typing_task = asyncio.create_task(
             typing_loop(
                 context.bot,
@@ -901,9 +1024,14 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         thinking_message = None
+        thinking_stop = None
+        thinking_task = None
         try:
+            lang = conversation_language(prompt, user)
             if should_show_thinking(prompt):
-                thinking_message = await send_thinking_message(update)
+                thinking_message, thinking_stop, thinking_task = await send_process_message(
+                    update, "thinking", lang
+                )
 
             answer, citations = await generate_text(
                 user.id,
@@ -912,16 +1040,21 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 user=user,
             )
 
-            await delete_thinking_message(thinking_message)
+            # The temporary UI is always removed BEFORE the real answer is sent.
+            await delete_process_message(thinking_message, thinking_stop, thinking_task)
             thinking_message = None
+            thinking_stop = None
+            thinking_task = None
             await send_answer(update, answer, citations)
 
         except Exception:
-            await delete_thinking_message(thinking_message)
+            await delete_process_message(thinking_message, thinking_stop, thinking_task)
             thinking_message = None
+            thinking_stop = None
+            thinking_task = None
             logger.exception("Message processing failed")
 
-            lang = detect_language(prompt, user)
+            lang = conversation_language(prompt, user)
             message = await quota_fallback(prompt, get_display_name(user), lang, web_required=needs_web_search(prompt))
             await update.message.reply_text(format_telegram_html(message), parse_mode="HTML")
 
@@ -948,6 +1081,8 @@ async def image_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with lock:
         stop_event = asyncio.Event()
         analyzing_message = None
+        analyzing_stop = None
+        analyzing_task = None
         typing_task = asyncio.create_task(
             typing_loop(
                 context.bot,
@@ -957,54 +1092,88 @@ async def image_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         try:
-            analyzing_message = await send_analyzing_image_message(update)
-            image_bytes = None
-            mime_type = "image/jpeg"
+            caption = update.message.caption or ""
+            lang = conversation_language(caption, user)
 
+            # Validate the attachment first; the process UI is only shown for a
+            # real image, so it can never get stranded on a non-image document.
             if update.message.photo:
                 photo = update.message.photo[-1]
                 tg_file = await context.bot.get_file(photo.file_id)
-                image_bytes = bytes(
-                    await tg_file.download_as_bytearray()
-                )
+                image_bytes = bytes(await tg_file.download_as_bytearray())
                 mime_type = "image/jpeg"
-
             elif update.message.document:
                 document = update.message.document
                 doc_mime = document.mime_type or ""
-
                 if not doc_mime.startswith("image/"):
+                    if lang == "hi":
+                        message = (
+                            "Abhi main **image files** analyze kar sakta hoon. "
+                            "Please JPG, JPEG, PNG ya WebP image bhejiye."
+                        )
+                    else:
+                        message = (
+                            "I can analyze **image files**. "
+                            "Please send a JPG, JPEG, PNG or WebP image."
+                        )
                     await update.message.reply_text(
-                        "Abhi main image files analyze kar sakta hoon. "
-                        "Please JPG, JPEG, PNG ya WebP image bhejiye."
+                        format_telegram_html(message), parse_mode="HTML"
                     )
                     return
-
                 tg_file = await context.bot.get_file(document.file_id)
-                image_bytes = bytes(
-                    await tg_file.download_as_bytearray()
-                )
+                image_bytes = bytes(await tg_file.download_as_bytearray())
                 mime_type = doc_mime
-
             else:
                 return
 
-            prompt = update.message.caption or ""
-
-            answer, citations = await generate_image_answer(
-                user.id, prompt, get_display_name(user), image_bytes, mime_type, user=user
+            # The user's previous language is intentionally reused when the
+            # image has no caption. A caption overrides it automatically.
+            analyzing_message, analyzing_stop, analyzing_task = await send_process_message(
+                update, "image", lang
             )
 
-            await delete_thinking_message(analyzing_message)
+            answer, citations = await generate_image_answer(
+                user.id,
+                caption,
+                get_display_name(user),
+                image_bytes,
+                mime_type,
+                user=user,
+            )
+
+            # Remove the temporary status BEFORE the actual answer is sent.
+            await delete_process_message(
+                analyzing_message, analyzing_stop, analyzing_task
+            )
             analyzing_message = None
+            analyzing_stop = None
+            analyzing_task = None
             await send_answer(update, answer, citations)
 
         except Exception:
-            await delete_thinking_message(analyzing_message)
+            await delete_process_message(
+                analyzing_message, analyzing_stop, analyzing_task
+            )
             analyzing_message = None
+            analyzing_stop = None
+            analyzing_task = None
             logger.exception("Image processing failed")
+
+            lang = conversation_language(
+                caption if 'caption' in locals() else "", user
+            )
+            if lang == "hi":
+                error_message = (
+                    "Image analyze karte waqt **problem** aa gayi. "
+                    "Thodi der baad dobara try karein."
+                )
+            else:
+                error_message = (
+                    "There was a **problem analyzing the image**. "
+                    "Please try again shortly."
+                )
             await update.message.reply_text(
-                "Image analysis temporarily unavailable. Please try again shortly."
+                format_telegram_html(error_message), parse_mode="HTML"
             )
 
         finally:
