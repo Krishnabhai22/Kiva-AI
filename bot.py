@@ -37,7 +37,7 @@ PORT = int(os.getenv("PORT", "10000"))
 PRIMARY_MODEL = "gemini-3.5-flash-lite"
 FALLBACK_MODEL = "gemini-2.5-flash-lite"
 MODEL_CANDIDATES = [PRIMARY_MODEL, FALLBACK_MODEL]
-WEB_MODEL_CANDIDATES = [FALLBACK_MODEL]
+WEB_MODEL_CANDIDATES = [PRIMARY_MODEL, FALLBACK_MODEL]
 
 OWNER_NAME = os.getenv("OWNER_NAME", "Krishna Singh")
 OWNER_USERNAME = os.getenv("OWNER_USERNAME", "qrishna")
@@ -296,12 +296,28 @@ def looks_like_astrology(text):
 # SEARCH CITATION EXTRACTION
 # =========================================================
 
+def _type_name(obj):
+    """Return a stable type name across google-genai SDK object/enums."""
+    value = getattr(obj, "type", None)
+    if value is None:
+        value = getattr(obj, "step_type", None)
+    value = getattr(value, "value", value)
+    return str(value).lower() if value is not None else ""
+
+
 def has_google_search_evidence(interaction):
     """Check whether the Interactions API actually executed Google Search."""
     for step in getattr(interaction, "steps", []) or []:
-        step_type = getattr(step, "type", None)
+        step_type = _type_name(step)
         if step_type in ("google_search_call", "google_search_result"):
             return True
+
+        # Defensive fallback for SDK versions that serialize the step type
+        # differently.
+        raw = str(step).lower()
+        if "google_search_call" in raw or "google_search_result" in raw:
+            return True
+
     return False
 
 
@@ -310,19 +326,28 @@ def extract_citations(interaction):
     seen = set()
 
     for step in getattr(interaction, "steps", []) or []:
-        if getattr(step, "type", None) != "model_output":
+        if _type_name(step) != "model_output":
             continue
 
         for block in getattr(step, "content", []) or []:
-            if getattr(block, "type", None) != "text":
+            if _type_name(block) != "text":
                 continue
 
             for annotation in getattr(block, "annotations", []) or []:
-                if getattr(annotation, "type", None) != "url_citation":
+                if _type_name(annotation) != "url_citation":
                     continue
 
-                url = getattr(annotation, "url", None)
-                title = getattr(annotation, "title", None) or "Source"
+                # Different google-genai SDK revisions expose this as
+                # .url or .uri, so support both.
+                url = (
+                    getattr(annotation, "url", None)
+                    or getattr(annotation, "uri", None)
+                )
+                title = (
+                    getattr(annotation, "title", None)
+                    or getattr(annotation, "name", None)
+                    or "Source"
+                )
 
                 if url and url not in seen:
                     seen.add(url)
@@ -422,9 +447,8 @@ async def generate_text(user_id, prompt, display_name):
             )
             citations = extract_citations(interaction)
 
-            # Require actual Google Search execution, not merely URL annotations.
-            # The Interactions API can return search-result steps even when the
-            # installed SDK does not expose URL annotations in the same shape.
+            # Require an actual Google Search execution for verification-sensitive
+            # questions. The helper above is tolerant of SDK enum/string differences.
             if web_required and not has_google_search_evidence(interaction):
                 raise RuntimeError(
                     "Google Search did not return a search result for this request."
