@@ -669,6 +669,28 @@ async def owner_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================================================
+# TEMPORARY PREMIUM THINKING UI
+# =========================================================
+
+async def send_thinking_message(update):
+    """Send a temporary visual processing message. No private reasoning is shown."""
+    return await update.message.reply_text(
+        "Thinking Process\n─────────────────"
+    )
+
+
+async def delete_thinking_message(thinking_message):
+    """Remove the temporary thinking message immediately before the final answer."""
+    if not thinking_message:
+        return
+    try:
+        await thinking_message.delete()
+    except Exception:
+        # Deletion failure must never break the actual answer.
+        pass
+
+
+# =========================================================
 # SEND ANSWER
 # =========================================================
 
@@ -727,16 +749,26 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         )
 
+        thinking_message = None
         try:
+            # Send the visual processing message first, then generate the answer.
+            thinking_message = await send_thinking_message(update)
+
             answer, citations = await generate_text(
                 user.id,
                 prompt,
                 get_display_name(user),
             )
 
+            # Delete the processing message immediately before the real answer.
+            await delete_thinking_message(thinking_message)
+            thinking_message = None
+
             await send_answer(update, answer, citations)
 
         except Exception:
+            await delete_thinking_message(thinking_message)
+            thinking_message = None
             logger.exception("Message processing failed")
 
             if needs_web_search(prompt):
@@ -836,7 +868,11 @@ async def image_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         )
 
+        thinking_message = None
         try:
+            # Send the visual processing message first, before downloading/analyzing.
+            thinking_message = await send_thinking_message(update)
+
             image_bytes = None
             mime_type = "image/jpeg"
 
@@ -878,9 +914,15 @@ async def image_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 mime_type,
             )
 
+            # Delete the processing message immediately before the real answer.
+            await delete_thinking_message(thinking_message)
+            thinking_message = None
+
             await send_answer(update, answer, citations)
 
         except Exception:
+            await delete_thinking_message(thinking_message)
+            thinking_message = None
             logger.exception("Image processing failed")
             await update.message.reply_text(
                 "Image download/analyze karte waqt temporary network problem aa gayi. "
@@ -1029,4 +1071,3 @@ def main():
 if __name__ == "__main__":
     main()
 
-    
