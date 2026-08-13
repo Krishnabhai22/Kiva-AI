@@ -32,6 +32,8 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("API_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 PORT = int(os.getenv("PORT", "10000"))
+TELEGRAM_TIMEOUT = 60
+TELEGRAM_RETRIES = 3
 
 # Current Gemini models supported by the Interactions API.
 PRIMARY_MODEL = "gemini-3.5-flash-lite"
@@ -762,6 +764,58 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================================================
+# TELEGRAM IMAGE DOWNLOAD WITH RETRY
+# =========================================================
+
+async def download_telegram_file(context, file_id):
+    last_error = None
+
+    for attempt in range(1, TELEGRAM_RETRIES + 1):
+        try:
+            tg_file = await context.bot.get_file(
+                file_id,
+                read_timeout=TELEGRAM_TIMEOUT,
+                write_timeout=TELEGRAM_TIMEOUT,
+                connect_timeout=TELEGRAM_TIMEOUT,
+                pool_timeout=TELEGRAM_TIMEOUT,
+            )
+
+            image_bytes = bytes(
+                await tg_file.download_as_bytearray(
+                    read_timeout=TELEGRAM_TIMEOUT,
+                    write_timeout=TELEGRAM_TIMEOUT,
+                    connect_timeout=TELEGRAM_TIMEOUT,
+                    pool_timeout=TELEGRAM_TIMEOUT,
+                )
+            )
+
+            if image_bytes:
+                logger.info(
+                    "Telegram file downloaded file_id=%s attempt=%s bytes=%s",
+                    file_id,
+                    attempt,
+                    len(image_bytes),
+                )
+                return image_bytes
+
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "Telegram file download failed attempt=%s/%s reason=%s",
+                attempt,
+                TELEGRAM_RETRIES,
+                exc,
+            )
+
+            if attempt < TELEGRAM_RETRIES:
+                await asyncio.sleep(2 ** (attempt - 1))
+
+    raise RuntimeError(
+        f"Telegram image download failed after {TELEGRAM_RETRIES} attempts"
+    ) from last_error
+
+
+# =========================================================
 # IMAGE HANDLER
 # =========================================================
 
@@ -788,9 +842,9 @@ async def image_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if update.message.photo:
                 photo = update.message.photo[-1]
-                tg_file = await context.bot.get_file(photo.file_id)
-                image_bytes = bytes(
-                    await tg_file.download_as_bytearray()
+                image_bytes = await download_telegram_file(
+                    context,
+                    photo.file_id,
                 )
                 mime_type = "image/jpeg"
 
@@ -805,9 +859,9 @@ async def image_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                     return
 
-                tg_file = await context.bot.get_file(document.file_id)
-                image_bytes = bytes(
-                    await tg_file.download_as_bytearray()
+                image_bytes = await download_telegram_file(
+                    context,
+                    document.file_id,
                 )
                 mime_type = doc_mime
 
@@ -829,8 +883,8 @@ async def image_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             logger.exception("Image processing failed")
             await update.message.reply_text(
-                "Image analyze karte waqt problem aa gayi. "
-                "Please image dobara bhejkar try karein."
+                "Image download/analyze karte waqt temporary network problem aa gayi. "
+                "Maine retry bhi kiya tha. Please image dobara bhejkar try karein."
             )
 
         finally:
@@ -935,6 +989,10 @@ def main():
     application = (
         Application.builder()
         .token(BOT_TOKEN)
+        .connect_timeout(TELEGRAM_TIMEOUT)
+        .read_timeout(TELEGRAM_TIMEOUT)
+        .write_timeout(TELEGRAM_TIMEOUT)
+        .pool_timeout(TELEGRAM_TIMEOUT)
         .post_init(post_init)
         .concurrent_updates(True)
         .build()
@@ -970,4 +1028,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
     
